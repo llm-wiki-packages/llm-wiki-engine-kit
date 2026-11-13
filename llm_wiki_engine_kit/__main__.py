@@ -37,7 +37,6 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--threads", type=int, default=1)
     run.add_argument("--read", action="append", default=[], help="one more read-only tree for the jail")
     run.add_argument("--unjailed", action="store_true", help="skip the jail")
-    run.add_argument("--inner", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     return serve(Path(args.store).name, _lazy(args.factory), threads=args.threads, reads=args.read, argv=argv)
 
