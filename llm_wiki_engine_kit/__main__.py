@@ -7,11 +7,12 @@ one more read-only tree, such as the directory that holds the factory's module.
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields
 import importlib
 import sys
 from pathlib import Path
 
-from . import serve
+from . import Timings, serve
 
 
 def _lazy(spec: str):
@@ -40,6 +41,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     run.add_argument("--read", action="append", default=[], help="one more read-only tree for the jail")
     run.add_argument("--unjailed", action="store_true", help="skip the jail")
+    waits = run.add_argument_group("waits, in seconds (the defaults are the service's)")
+    for field in fields(Timings):
+        flag = "--" + field.name.replace("_", "-") + "-seconds"
+        waits.add_argument(flag, dest=field.name, type=float, default=field.default)
     args = parser.parse_args(argv)
     return serve(
         Path(args.store).name,
@@ -48,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         reads=args.read,
         argv=argv,
         timeout_seconds=args.timeout_seconds,
+        timings=Timings(**{field.name: getattr(args, field.name) for field in fields(Timings)}),
     )
 
 

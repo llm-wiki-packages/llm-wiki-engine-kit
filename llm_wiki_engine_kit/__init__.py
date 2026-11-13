@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
@@ -65,6 +66,18 @@ _WRITE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 
 Converter = Callable[[Path, Path, dict], "dict | None"]
 Factory = Callable[[dict], Converter]
+
+
+@dataclass(frozen=True)
+class Timings:
+    """The daemon's waits, in seconds. The defaults are the service's; a test passes sub-second ones."""
+
+    scan: float = SCAN_SECONDS
+    poll: float = _POLL_SECONDS
+    backoff: float = BACKOFF_SECONDS
+    backoff_ceiling: float = BACKOFF_CEILING
+    stop_escalate: float = STOP_ESCALATE_SECONDS
+
 
 # The inner process's running converts, `name -> (folder, attempts before this one)`, so a stop can take its counts
 # back; and where it leaves its markers, None outside an inner process.
@@ -336,7 +349,7 @@ def _outer_gone(kit: Path) -> bool:
     return True
 
 
-def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Path) -> int:
+def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Path, timings: Timings) -> int:
     """Answer requests until a converter raises, `RECYCLE_AFTER` files are done, or the outer process is gone.
 
     A folder an earlier inner process already tried runs alone, so a crash charges its attempt to that folder only.
@@ -374,9 +387,9 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
                         running[pool.submit(_work, folder, converter)] = folder.name
             if not running:
                 skipped.clear()
-                time.sleep(SCAN_SECONDS)
+                time.sleep(timings.scan)
                 continue
-            finished, _ = wait(running, timeout=SCAN_SECONDS, return_when=FIRST_COMPLETED)
+            finished, _ = wait(running, timeout=timings.scan, return_when=FIRST_COMPLETED)
             for future in finished:
                 name = running.pop(future)
                 if name == alone:
@@ -466,7 +479,7 @@ def _reads(extra: Iterable[str | os.PathLike]) -> list[Path]:
     return found
 
 
-def _outer(store: Path, scratch: Path, reads: Iterable[str | os.PathLike], unjailed: bool) -> int:
+def _outer(store: Path, scratch: Path, reads: Iterable[str | os.PathLike], unjailed: bool, timings: Timings) -> int:
     """Start inner processes one after another until a signal; a crashed one is started again after a backoff.
 
     The scratch is wiped before each start, and the inner process runs in the interpreter's prefix, a tree the jail
@@ -482,7 +495,7 @@ def _outer(store: Path, scratch: Path, reads: Iterable[str | os.PathLike], unjai
         argv = _jail_argv(nono, store, scratch, _reads(reads))
     cwd = Path(sys.prefix).resolve()
     env = {**os.environ, INNER_ENV: "1"}
-    backoff, crashes = BACKOFF_SECONDS, 0
+    backoff, crashes = timings.backoff, 0
     child: list[subprocess.Popen] = []
     stopping: list[int] = []
 
@@ -499,14 +512,14 @@ def _outer(store: Path, scratch: Path, reads: Iterable[str | os.PathLike], unjai
         try:
             # Its own process group, so a kill reaches the jail's runtime and the inner process both.
             child.append(subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True))
-            code = _watch(child[-1], scratch / KIT_DIR, stopping)
+            code = _watch(child[-1], scratch / KIT_DIR, stopping, timings)
         finally:
             os.close(lock)
         child.clear()
         if stopping:
             return 0
         if code == RECYCLE_EXIT:
-            backoff, crashes = BACKOFF_SECONDS, 0
+            backoff, crashes = timings.backoff, 0
             continue
         crashes = 0 if (scratch / KIT_DIR / ANSWERED).exists() else crashes + 1
         if crashes >= CRASH_LIMIT:
@@ -514,7 +527,7 @@ def _outer(store: Path, scratch: Path, reads: Iterable[str | os.PathLike], unjai
             return 1
         _say(f"the inner process exited {code}; starting another in {backoff:g}s")
         time.sleep(backoff)
-        backoff = min(backoff * 2, BACKOFF_CEILING)
+        backoff = min(backoff * 2, timings.backoff_ceiling)
     return 0
 
 
@@ -568,18 +581,18 @@ def _overdue(kit: Path, now: float) -> str | None:
     return None
 
 
-def _watch(child: subprocess.Popen, kit: Path, stopping: list[int]) -> int:
+def _watch(child: subprocess.Popen, kit: Path, stopping: list[int], timings: Timings) -> int:
     """Wait for the inner process; kill it where a convert runs past its timeout, which then counts as an attempt."""
     stop_seen: float | None = None
     while True:
         try:
-            return child.wait(_POLL_SECONDS)
+            return child.wait(timings.poll)
         except subprocess.TimeoutExpired:
             pass
         if stopping:
             stop_seen = stop_seen or time.monotonic()
-            if time.monotonic() - stop_seen > STOP_ESCALATE_SECONDS:
-                _say(f"the inner process did not stop in {STOP_ESCALATE_SECONDS:g}s; killing it")
+            if time.monotonic() - stop_seen > timings.stop_escalate:
+                _say(f"the inner process did not stop in {timings.stop_escalate:g}s; killing it")
                 _signal_group(child, signal.SIGKILL)
                 return child.wait()
             continue
@@ -598,6 +611,7 @@ def serve(
     env: Mapping[str, str] | None = None,
     argv: list[str] | None = None,
     timeout_seconds: float = TIMEOUT_SECONDS,
+    timings: Timings = Timings(),
 ) -> int:
     """Run the daemon for `engine` and answer its exit code; `argv` carries `--store`, `--cache`, `--unjailed`.
 
@@ -613,6 +627,6 @@ def serve(
     if os.environ.pop(INNER_ENV, "") == "1":
         _apply_env(scratch, env or {})
         _DEFAULT_TIMEOUT[0] = float(timeout_seconds)
-        return _inner(engine, factory, max(1, threads), store, scratch)
+        return _inner(engine, factory, max(1, threads), store, scratch, timings)
     store.mkdir(parents=True, exist_ok=True)
-    return _outer(store, scratch, reads, args.unjailed)
+    return _outer(store, scratch, reads, args.unjailed, timings)

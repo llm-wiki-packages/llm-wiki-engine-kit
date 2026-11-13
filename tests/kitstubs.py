@@ -1,6 +1,8 @@
 """Stand-in factories the daemon tests name with `--factory kitstubs:<name>`."""
 
+import ctypes
 import os
+import resource
 import shutil
 import signal
 import socket
@@ -117,6 +119,10 @@ def crash(daemon):
         options = request.get("options", {})
         if options.get("crash"):
             time.sleep(options.get("delay", 0))
+            # No core dump: a core handler such as apport costs about a second per crash, and ignores the limit.
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            if sys.platform == "linux":
+                ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE, 0
             # To this thread: `os.kill` lands on the main thread, and the worker could publish before the process dies.
             signal.pthread_kill(threading.get_ident(), signal.SIGSEGV)
         if options.get("vanish"):

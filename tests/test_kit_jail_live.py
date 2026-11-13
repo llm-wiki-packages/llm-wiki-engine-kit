@@ -53,7 +53,7 @@ def probed(root: Path, port: int, *, jailed: bool) -> list[str]:
     options = {"outside": str(root / "outside.txt"), "port": port, "canary": str(canary)}
     (folder / "request.json").write_text(json.dumps({"body": "body.txt", "options": options}), encoding="utf-8")
     argv = [sys.executable, "-m", "llm_wiki_engine_kit", "serve", "--store", str(store), "--cache", str(root / "cache")]
-    argv += ["--factory", "kitstubs:probe", "--read", str(TESTS)]
+    argv += ["--factory", "kitstubs:probe", "--read", str(TESTS), "--scan-seconds", "0.05", "--poll-seconds", "0.05"]
     if not jailed:
         argv.append("--unjailed")
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(KIT), str(TESTS)])}
@@ -94,7 +94,7 @@ def test_jailed_a_module_the_converter_plants_never_runs_in_the_next_inner_proce
         (folder / "body.txt").write_text("hello", encoding="utf-8")
         (folder / "request.json").write_text(json.dumps({"body": "body.txt", "options": options}), encoding="utf-8")
     argv = [sys.executable, "-m", "llm_wiki_engine_kit", "serve", "--store", str(store), "--cache", str(live / "cache")]
-    argv += ["--factory", "kitstubs:plant", "--read", str(TESTS)]
+    argv += ["--factory", "kitstubs:plant", "--read", str(TESTS), "--scan-seconds", "0.05", "--poll-seconds", "0.05"]
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(KIT), str(TESTS)])}
     proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     try:

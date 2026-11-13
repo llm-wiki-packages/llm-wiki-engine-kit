@@ -17,6 +17,10 @@ import llm_wiki_engine_kit as kit
 KIT = Path(kit.__file__).resolve().parents[1]
 TESTS = Path(__file__).resolve().parent
 WAIT = 60
+# Sub-second waits, so a daemon test costs its own work and not the service's patience.
+ESCALATE = 0.5
+FAST = ["--scan-seconds", "0.05", "--poll-seconds", "0.05", "--backoff-seconds", "0.05"]
+FAST += ["--backoff-ceiling-seconds", "0.2", "--stop-escalate-seconds", str(ESCALATE)]
 
 
 def a_folder(store: Path, name: str, text: str = "hello", *, options=None) -> Path:
@@ -49,7 +53,7 @@ def daemon(tmp_path):
 
     def start(factory: str, *extra: str, jailed: bool = False, env=None):
         argv = [sys.executable, "-m", "llm_wiki_engine_kit", "serve", "--store", str(tmp_path / "store")]
-        argv += ["--cache", str(tmp_path / "cache"), "--factory", f"kitstubs:{factory}", *extra]
+        argv += ["--cache", str(tmp_path / "cache"), "--factory", f"kitstubs:{factory}", *FAST, *extra]
         if not jailed:
             argv.append("--unjailed")
         full = {**os.environ, "PYTHONPATH": os.pathsep.join([str(KIT), str(TESTS)]), **(env or {})}
@@ -341,8 +345,8 @@ def test_a_crashing_convert_is_tried_twice_then_answered_unreadable_and_the_next
 
 def test_with_two_threads_a_crash_charges_only_the_folder_that_crashed(tmp_path, daemon):
     store = tmp_path / "store"
-    crashing = a_folder(store, "a", options={"crash": True, "delay": 0.5})
-    slower = a_folder(store, "b", text="innocent", options={"slow": 2})
+    crashing = a_folder(store, "a", options={"crash": True, "delay": 0.2})
+    slower = a_folder(store, "b", text="innocent", options={"slow": 0.8})
     proc = daemon("crash", "--threads", "2")
     wait_for(slower / "result.json", proc)
     wait_for(crashing / "result.json", proc)
@@ -439,8 +443,8 @@ def test_an_inner_process_deaf_to_sigterm_is_killed_once_the_stop_runs_long(tmp_
     wait_for(folder / ".tmp-output.md", proc)
     started = time.monotonic()
     proc.send_signal(signal.SIGTERM)
-    assert proc.wait(kit.STOP_ESCALATE_SECONDS + WAIT / 2) == 0
-    assert time.monotonic() - started >= kit.STOP_ESCALATE_SECONDS - 1
+    assert proc.wait(WAIT) == 0
+    assert time.monotonic() - started >= ESCALATE * 0.8
 
 
 def test_when_the_outer_process_is_killed_the_converters_own_child_goes_too(tmp_path, daemon):
@@ -490,7 +494,7 @@ def test_an_oversized_marker_is_not_read(tmp_path):
 
 
 def test_a_convert_past_its_timeout_is_killed_and_counts_as_an_attempt(tmp_path, daemon):
-    folder = a_folder(tmp_path / "store", "k", options={"timeout_seconds": 1})
+    folder = a_folder(tmp_path / "store", "k", options={"timeout_seconds": 0.3})
     proc = daemon("stall")
     wait_for(folder / "result.json", proc)
     assert result_of(folder) == {"reason": "unreadable", "traits": []}
@@ -532,7 +536,8 @@ def test_a_module_planted_in_the_scratch_or_the_cwd_never_runs(tmp_path, daemon)
 def test_an_engine_that_passes_its_own_argv_serves_and_does_not_re_exec_without_end(tmp_path):
     folder = a_folder(tmp_path / "store", "k")
     argv = ["--store", str(tmp_path / "store"), "--cache", str(tmp_path / "cache"), "--unjailed"]
-    code = f"import sys, kitstubs, llm_wiki_engine_kit as k; sys.exit(k.serve('stub', kitstubs.echo, argv={argv!r}))"
+    code = "import sys, kitstubs, llm_wiki_engine_kit as k; "
+    code += f"sys.exit(k.serve('stub', kitstubs.echo, argv={argv!r}, timings=k.Timings(scan=0.05)))"
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(KIT), str(TESTS)])}
     proc = subprocess.Popen([sys.executable, "-c", code], env=env, stderr=subprocess.PIPE, start_new_session=True)
     try:
