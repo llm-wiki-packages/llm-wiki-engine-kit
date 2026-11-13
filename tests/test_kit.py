@@ -17,6 +17,10 @@ import llm_wiki_engine_kit as kit
 KIT = Path(kit.__file__).resolve().parents[1]
 TESTS = Path(__file__).resolve().parent
 WAIT = 60
+# Sub-second waits, so a daemon test costs its own work and not the service's patience.
+ESCALATE = 0.5
+FAST = ["--scan-seconds", "0.05", "--poll-seconds", "0.05", "--backoff-seconds", "0.05"]
+FAST += ["--backoff-ceiling-seconds", "0.2", "--stop-escalate-seconds", str(ESCALATE)]
 
 
 def a_folder(store: Path, name: str, text: str = "hello", *, options=None) -> Path:
@@ -49,7 +53,7 @@ def daemon(tmp_path):
 
     def start(factory: str, *extra: str, jailed: bool = False, env=None):
         argv = [sys.executable, "-m", "llm_wiki_engine_kit", "serve", "--store", str(tmp_path / "store")]
-        argv += ["--cache", str(tmp_path / "cache"), "--factory", f"kitstubs:{factory}", *extra]
+        argv += ["--cache", str(tmp_path / "cache"), "--factory", f"kitstubs:{factory}", *FAST, *extra]
         if not jailed:
             argv.append("--unjailed")
         full = {**os.environ, "PYTHONPATH": os.pathsep.join([str(KIT), str(TESTS)]), **(env or {})}
@@ -339,6 +343,175 @@ def test_a_crashing_convert_is_tried_twice_then_answered_unreadable_and_the_next
     assert proc.poll() is None
 
 
+def test_with_two_threads_a_crash_charges_only_the_folder_that_crashed(tmp_path, daemon):
+    store = tmp_path / "store"
+    crashing = a_folder(store, "a", options={"crash": True, "delay": 0.2})
+    slower = a_folder(store, "b", text="innocent", options={"slow": 0.8})
+    proc = daemon("crash", "--threads", "2")
+    wait_for(slower / "result.json", proc)
+    wait_for(crashing / "result.json", proc)
+    assert result_of(slower) == {"reason": None, "traits": []}
+    assert (slower / "output.md").read_text(encoding="utf-8") == "innocent"
+    assert result_of(crashing) == {"reason": "unreadable", "traits": []}
+
+
+def test_a_stop_takes_back_the_attempt_of_the_folder_in_progress(tmp_path, daemon):
+    folder = a_folder(tmp_path / "store", "k")
+    for _ in range(kit.MAX_ATTEMPTS):
+        proc = daemon("stall")
+        wait_for(folder / ".tmp-output.md", proc)
+        assert (folder / ".tmp-attempts").read_text(encoding="utf-8") == "1"
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(WAIT) == 0
+        assert not (folder / ".tmp-attempts").exists()
+        (folder / ".tmp-output.md").unlink()
+    assert not (folder / "result.json").exists()
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as held:
+            return held.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return True
+
+
+def _gone_within(pid: int, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class _Exited(Exception):
+    pass
+
+
+def test_a_second_signal_inside_the_stop_does_not_deadlock_and_both_signals_are_ignored_first(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k")
+    (folder / ".tmp-attempts").write_text("1", encoding="ascii")
+    calls = []
+
+    class Reentering(dict):
+        def values(self):
+            # A second SIGTERM lands while the stop holds the lock.
+            if "reentered" not in calls:
+                calls.append("reentered")
+                try:
+                    kit._stop(signal.SIGTERM, None)
+                except _Exited:
+                    pass
+            return super().values()
+
+    def exit_(code):
+        calls.append(("exit", code))
+        raise _Exited
+
+    monkeypatch.setattr(kit, "_RUNNING", Reentering({"k": (folder, 0)}))
+    monkeypatch.setattr(os, "_exit", exit_)
+    monkeypatch.setattr(signal, "signal", lambda signum, handler: calls.append((signum, handler)))
+    stopper = threading.Thread(target=lambda: pytest.raises(_Exited, kit._stop, signal.SIGTERM, None), daemon=True)
+    stopper.start()
+    stopper.join(5)
+    assert not stopper.is_alive(), "the stop deadlocked on its own lock"
+    assert calls[:2] == [(signal.SIGTERM, signal.SIG_IGN), (signal.SIGINT, signal.SIG_IGN)]
+    assert not (folder / ".tmp-attempts").exists()
+
+
+@pytest.mark.parametrize("burst", [2, 8])
+def test_signals_back_to_back_stop_the_inner_process_and_take_the_attempt_back(tmp_path, daemon, burst):
+    folder = a_folder(tmp_path / "store", "k")
+    record = tmp_path / "inner-pid"
+    proc = daemon("stall", env={"KIT_STUB_RECORD": str(record)})
+    wait_for(folder / ".tmp-output.md", proc)
+    inner = int(record.read_text(encoding="utf-8").split()[0])
+    for _ in range(burst):
+        os.kill(inner, signal.SIGTERM)
+    assert _gone_within(inner, 10), "the inner process hung in its stop"
+    assert not (folder / ".tmp-attempts").exists()
+
+
+def test_an_inner_process_deaf_to_sigterm_is_killed_once_the_stop_runs_long(tmp_path, daemon):
+    folder = a_folder(tmp_path / "store", "k")
+    proc = daemon("deaf")
+    wait_for(folder / ".tmp-output.md", proc)
+    started = time.monotonic()
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(WAIT) == 0
+    assert time.monotonic() - started >= ESCALATE * 0.8
+
+
+def test_when_the_outer_process_is_killed_the_converters_own_child_goes_too(tmp_path, daemon):
+    folder = a_folder(tmp_path / "store", "k")
+    record = tmp_path / "child-pid"
+    proc = daemon("spawner", env={"KIT_STUB_RECORD": str(record)})
+    deadline = time.monotonic() + WAIT
+    while not record.exists() or not record.read_text(encoding="utf-8").strip():
+        assert time.monotonic() < deadline, "the converter started no child"
+        time.sleep(0.05)
+    child = int(record.read_text(encoding="utf-8").split()[0])
+    try:
+        os.kill(proc.pid, signal.SIGKILL)
+        assert _gone_within(child, 15), "the converter's child outlived the daemon"
+    finally:
+        if _alive(child):
+            os.kill(child, signal.SIGKILL)
+    assert not (folder / "result.json").exists()
+
+
+def test_a_marker_that_is_a_fifo_does_not_hang_the_timeout_check(tmp_path):
+    kit_dir = tmp_path / ".kit"
+    kit_dir.mkdir()
+    os.mkfifo(kit_dir / f"{kit.CONVERTING}trap")
+    found = []
+    reader = threading.Thread(target=lambda: found.append(kit._overdue(kit_dir, time.time() + 10_000)), daemon=True)
+    reader.start()
+    reader.join(5)
+    assert not reader.is_alive(), "the timeout check hung on a FIFO"
+    assert found == [None]
+
+
+def test_a_kit_folder_that_is_a_link_is_not_followed(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / f"{kit.CONVERTING}k").write_text("1", encoding="ascii")
+    (tmp_path / ".kit").symlink_to(real)
+    assert kit._overdue(real, time.time() + 10) == "k"
+    assert kit._overdue(tmp_path / ".kit", time.time() + 10) is None
+
+
+def test_an_oversized_marker_is_not_read(tmp_path):
+    kit_dir = tmp_path / ".kit"
+    kit_dir.mkdir()
+    (kit_dir / f"{kit.CONVERTING}k").write_text("1" + " " * 4096, encoding="ascii")
+    assert kit._overdue(kit_dir, time.time() + 10) is None
+
+
+def test_a_convert_past_its_timeout_is_killed_and_counts_as_an_attempt(tmp_path, daemon):
+    folder = a_folder(tmp_path / "store", "k", options={"timeout_seconds": 0.3})
+    proc = daemon("stall")
+    wait_for(folder / "result.json", proc)
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+    assert proc.poll() is None
+
+
+def test_a_factory_that_always_fails_stops_the_daemon_after_five_crashes(tmp_path, daemon):
+    a_folder(tmp_path / "store", "k")
+    proc = daemon("broken")
+    try:
+        proc.wait(WAIT)
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"the daemon still runs after {WAIT}s of crashes")
+    assert proc.returncode == 1
+    assert f"{kit.CRASH_LIMIT} inner processes in a row".encode() in proc.stderr.read()
+
+
 def test_a_folder_removed_mid_convert_is_skipped_and_the_daemon_goes_on(tmp_path, daemon):
     store = tmp_path / "store"
     gone = a_folder(store, "a", options={"vanish": True})
@@ -363,7 +536,8 @@ def test_a_module_planted_in_the_scratch_or_the_cwd_never_runs(tmp_path, daemon)
 def test_an_engine_that_passes_its_own_argv_serves_and_does_not_re_exec_without_end(tmp_path):
     folder = a_folder(tmp_path / "store", "k")
     argv = ["--store", str(tmp_path / "store"), "--cache", str(tmp_path / "cache"), "--unjailed"]
-    code = f"import sys, kitstubs, llm_wiki_engine_kit as k; sys.exit(k.serve('stub', kitstubs.echo, argv={argv!r}))"
+    code = "import sys, kitstubs, llm_wiki_engine_kit as k; "
+    code += f"sys.exit(k.serve('stub', kitstubs.echo, argv={argv!r}, timings=k.Timings(scan=0.05)))"
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(KIT), str(TESTS)])}
     proc = subprocess.Popen([sys.executable, "-c", code], env=env, stderr=subprocess.PIPE, start_new_session=True)
     try:

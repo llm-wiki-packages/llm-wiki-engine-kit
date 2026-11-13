@@ -7,11 +7,12 @@ one more read-only tree, such as the directory that holds the factory's module.
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields
 import importlib
 import sys
 from pathlib import Path
 
-from . import serve
+from . import Timings, serve
 
 
 def _lazy(spec: str):
@@ -35,10 +36,25 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--cache", required=True, help="<cache>/engines/<engine>; the scratch is its tmp/")
     run.add_argument("--factory", required=True, help="module:function that builds the converter")
     run.add_argument("--threads", type=int, default=1)
+    run.add_argument(
+        "--timeout-seconds", type=float, default=1800.0, help="a convert's time, unless its request's options name one"
+    )
     run.add_argument("--read", action="append", default=[], help="one more read-only tree for the jail")
     run.add_argument("--unjailed", action="store_true", help="skip the jail")
+    waits = run.add_argument_group("waits, in seconds (the defaults are the service's)")
+    for field in fields(Timings):
+        flag = "--" + field.name.replace("_", "-") + "-seconds"
+        waits.add_argument(flag, dest=field.name, type=float, default=field.default)
     args = parser.parse_args(argv)
-    return serve(Path(args.store).name, _lazy(args.factory), threads=args.threads, reads=args.read, argv=argv)
+    return serve(
+        Path(args.store).name,
+        _lazy(args.factory),
+        threads=args.threads,
+        reads=args.read,
+        argv=argv,
+        timeout_seconds=args.timeout_seconds,
+        timings=Timings(**{field.name: getattr(args, field.name) for field in fields(Timings)}),
+    )
 
 
 if __name__ == "__main__":

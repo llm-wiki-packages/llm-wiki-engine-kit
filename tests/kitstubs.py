@@ -1,11 +1,23 @@
 """Stand-in factories the daemon tests name with `--factory kitstubs:<name>`."""
 
+import ctypes
 import os
+import resource
 import shutil
 import signal
 import socket
+import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
+
+
+def _record(pid: int) -> None:
+    record = os.environ.get("KIT_STUB_RECORD")
+    if record:
+        with open(record, "a", encoding="utf-8") as held:
+            held.write(f"{pid}\n")
 
 
 def echo(daemon):
@@ -39,9 +51,10 @@ def raising(daemon):
 
 
 def stall(daemon):
-    """Writes half an output, then hangs: the test kills it mid-convert."""
+    """Writes half an output, then hangs: the test kills it mid-convert. Its pid goes to `KIT_STUB_RECORD`, if set."""
 
     def convert(body: Path, out: Path, request: dict):
+        _record(os.getpid())
         out.write_text("half", encoding="utf-8")
         time.sleep(600)
 
@@ -99,16 +112,45 @@ def plant(daemon):
 
 
 def crash(daemon):
-    """`crash` in the options kills the process with SIGSEGV; `vanish` removes the folder mid-convert."""
+    """`crash` kills the process with SIGSEGV after `delay` seconds; `vanish` removes the folder mid-convert; `slow`
+    waits that many seconds before it writes."""
 
     def convert(body: Path, out: Path, request: dict):
         options = request.get("options", {})
         if options.get("crash"):
-            os.kill(os.getpid(), signal.SIGSEGV)
+            time.sleep(options.get("delay", 0))
+            # No core dump: a core handler such as apport costs about a second per crash, and ignores the limit.
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            if sys.platform == "linux":
+                ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE, 0
+            # To this thread: `os.kill` lands on the main thread, and the worker could publish before the process dies.
+            signal.pthread_kill(threading.get_ident(), signal.SIGSEGV)
         if options.get("vanish"):
             shutil.rmtree(body.parent)
             return None
+        time.sleep(options.get("slow", 0))
         out.write_text(body.read_text(encoding="utf-8"), encoding="utf-8")
         return None
+
+    return convert
+
+
+def broken(daemon):
+    raise RuntimeError("the engine does not import")
+
+
+def deaf(daemon):
+    """Ignores SIGTERM in the inner process, then stalls like `stall`: only a SIGKILL ends it."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    return stall(daemon)
+
+
+def spawner(daemon):
+    """Starts a long child of its own, records the child's pid, then hangs."""
+
+    def convert(body: Path, out: Path, request: dict):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+        _record(child.pid)
+        time.sleep(600)
 
     return convert
