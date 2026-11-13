@@ -7,8 +7,15 @@ from pathlib import Path
 
 
 def echo(daemon):
-    """Copies the body to `out`, with the pid that built the converter and the pid that ran it."""
+    """Copies the body to `out`, with the pid that built the converter and the pid that ran it.
+
+    Each call also appends its pid to the file `KIT_STUB_RECORD` names, wherever it runs.
+    """
     built = os.getpid()
+    record = os.environ.get("KIT_STUB_RECORD")
+    if record:
+        with open(record, "a", encoding="utf-8") as held:
+            held.write(f"{built}\n")
 
     def convert(body: Path, out: Path, request: dict):
         text = body.read_text(encoding="utf-8")

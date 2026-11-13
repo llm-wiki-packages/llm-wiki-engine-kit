@@ -209,14 +209,16 @@ def test_a_request_whose_body_leaves_the_folder_does_not_read(tmp_path):
 
 def test_the_factory_never_runs_in_the_outer_process(tmp_path, daemon):
     folder = a_folder(tmp_path / "store", "k")
-    proc = daemon("echo")
+    record = tmp_path / "factory-pids"
+    proc = daemon("echo", env={"KIT_STUB_RECORD": str(record)})
     wait_for(folder / "result.json", proc)
     lines = (folder / "output.md").read_text(encoding="utf-8").splitlines()
     factory = int(lines[-2].split()[1])
     convert = int(lines[-1].split()[1])
     assert lines[0] == "hello"
-    assert factory != proc.pid
     assert convert == factory
+    assert record.read_text(encoding="utf-8").split() == [str(factory)]
+    assert factory != proc.pid
 
 
 def test_after_an_exception_the_inner_process_exits_and_a_new_one_takes_the_next(tmp_path, daemon):
