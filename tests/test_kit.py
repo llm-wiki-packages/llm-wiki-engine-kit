@@ -339,6 +339,50 @@ def test_a_crashing_convert_is_tried_twice_then_answered_unreadable_and_the_next
     assert proc.poll() is None
 
 
+def test_with_two_threads_a_crash_charges_only_the_folder_that_crashed(tmp_path, daemon):
+    store = tmp_path / "store"
+    crashing = a_folder(store, "a", options={"crash": True, "delay": 0.5})
+    slower = a_folder(store, "b", text="innocent", options={"slow": 2})
+    proc = daemon("crash", "--threads", "2")
+    wait_for(slower / "result.json", proc)
+    wait_for(crashing / "result.json", proc)
+    assert result_of(slower) == {"reason": None, "traits": []}
+    assert (slower / "output.md").read_text(encoding="utf-8") == "innocent"
+    assert result_of(crashing) == {"reason": "unreadable", "traits": []}
+
+
+def test_a_stop_takes_back_the_attempt_of_the_folder_in_progress(tmp_path, daemon):
+    folder = a_folder(tmp_path / "store", "k")
+    for _ in range(kit.MAX_ATTEMPTS):
+        proc = daemon("stall")
+        wait_for(folder / ".tmp-output.md", proc)
+        assert (folder / ".tmp-attempts").read_text(encoding="utf-8") == "1"
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(WAIT) == 0
+        assert not (folder / ".tmp-attempts").exists()
+        (folder / ".tmp-output.md").unlink()
+    assert not (folder / "result.json").exists()
+
+
+def test_a_convert_past_its_timeout_is_killed_and_counts_as_an_attempt(tmp_path, daemon):
+    folder = a_folder(tmp_path / "store", "k", options={"timeout_seconds": 1})
+    proc = daemon("stall")
+    wait_for(folder / "result.json", proc)
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+    assert proc.poll() is None
+
+
+def test_a_factory_that_always_fails_stops_the_daemon_after_five_crashes(tmp_path, daemon):
+    a_folder(tmp_path / "store", "k")
+    proc = daemon("broken")
+    try:
+        proc.wait(WAIT)
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"the daemon still runs after {WAIT}s of crashes")
+    assert proc.returncode == 1
+    assert f"{kit.CRASH_LIMIT} inner processes in a row".encode() in proc.stderr.read()
+
+
 def test_a_folder_removed_mid_convert_is_skipped_and_the_daemon_goes_on(tmp_path, daemon):
     store = tmp_path / "store"
     gone = a_folder(store, "a", options={"vanish": True})

@@ -100,17 +100,24 @@ def plant(daemon):
 
 
 def crash(daemon):
-    """`crash` in the options kills the process with SIGSEGV; `vanish` removes the folder mid-convert."""
+    """`crash` kills the process with SIGSEGV after `delay` seconds; `vanish` removes the folder mid-convert; `slow`
+    waits that many seconds before it writes."""
 
     def convert(body: Path, out: Path, request: dict):
         options = request.get("options", {})
         if options.get("crash"):
+            time.sleep(options.get("delay", 0))
             # To this thread: `os.kill` lands on the main thread, and the worker could publish before the process dies.
             signal.pthread_kill(threading.get_ident(), signal.SIGSEGV)
         if options.get("vanish"):
             shutil.rmtree(body.parent)
             return None
+        time.sleep(options.get("slow", 0))
         out.write_text(body.read_text(encoding="utf-8"), encoding="utf-8")
         return None
 
     return convert
+
+
+def broken(daemon):
+    raise RuntimeError("the engine does not import")

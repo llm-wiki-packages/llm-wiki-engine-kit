@@ -18,6 +18,7 @@ name first.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -26,6 +27,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -43,7 +45,16 @@ RECYCLE_EXIT = 75
 NONO_ENV = "LLM_WIKI_NONO"
 INNER_ENV = "LLM_WIKI_ENGINE_KIT_INNER"
 # The outer process's wait before it starts an inner process again after one that crashed: doubled per crash.
-BACKOFF_SECONDS, BACKOFF_CEILING = 1.0, 30.0
+BACKOFF_SECONDS, BACKOFF_CEILING = 0.5, 30.0
+# This many inner processes in a row that end with no file answered stop the daemon, so its service reads failed.
+CRASH_LIMIT = 5
+# A convert's time, unless the request's options carry `timeout_seconds`; past it the outer process kills the inner.
+TIMEOUT_SECONDS = 1800.0
+# The scratch's own folder for what the inner process tells the outer one: a marker per running convert, whose
+# mtime is its start and whose text its timeout, and `answered` once a file is answered.
+# `outer.lock` is held by the outer process while the inner one runs: a free lock means the outer process is gone.
+KIT_DIR, ANSWERED, CONVERTING, OUTER_LOCK = ".kit", "answered", "converting-", "outer.lock"
+_POLL_SECONDS = 0.25
 UNREADABLE = {"reason": "unreadable", "traits": []}
 _BODY = re.compile(r"body(\.[A-Za-z0-9]+)*")
 _READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -51,6 +62,13 @@ _WRITE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 
 Converter = Callable[[Path, Path, dict], "dict | None"]
 Factory = Callable[[dict], Converter]
+
+# The inner process's running converts, `name -> (folder, attempts before this one)`, so a stop can take its counts
+# back; and where it leaves its markers, None outside an inner process.
+_RUNNING: dict[str, tuple[Path, int]] = {}
+_LOCK = threading.Lock()
+_KIT: list[Path] = []
+_DEFAULT_TIMEOUT = [TIMEOUT_SECONDS]
 
 
 def _say(message: str) -> None:
@@ -169,12 +187,15 @@ def answer(folder: Path, request: dict, converter: Converter) -> bool:
             result = UNREADABLE
         else:
             _write_new(fd, TMP_ATTEMPTS, str(tried + 1).encode("ascii"))
+            _started(folder, tried, request)
             try:
                 got = converter(folder / request["body"], folder / TMP_OUTPUT, request)
                 result = None if got is None else _shape(got)
             except Exception as exc:
                 _say(f"{folder.name}: the converter raised {type(exc).__name__}: {exc}")
                 result, failed = UNREADABLE, True
+            finally:
+                _ended(folder)
         if result is None:
             if _regular(fd, TMP_OUTPUT):
                 _sync(fd, TMP_OUTPUT)
@@ -192,6 +213,50 @@ def answer(folder: Path, request: dict, converter: Converter) -> bool:
         os.close(fd)
     _say(f"{folder.name}: answered reason={result['reason']}")
     return failed
+
+
+def _timeout(request: dict) -> float:
+    given = request.get("options", {}).get("timeout_seconds")
+    if isinstance(given, (int, float)) and not isinstance(given, bool) and given > 0:
+        return float(given)
+    return _DEFAULT_TIMEOUT[0]
+
+
+def _started(folder: Path, tried: int, request: dict) -> None:
+    with _LOCK:
+        _RUNNING[folder.name] = (folder, tried)
+    for kit in _KIT:
+        (kit / f"{CONVERTING}{folder.name}").write_text(str(_timeout(request)), encoding="ascii")
+
+
+def _ended(folder: Path) -> None:
+    with _LOCK:
+        _RUNNING.pop(folder.name, None)
+    for kit in _KIT:
+        (kit / f"{CONVERTING}{folder.name}").unlink(missing_ok=True)
+
+
+def _take_back(folder: Path, tried: int) -> None:
+    """Set a running folder's count back to what it held before this attempt: a stop is not the file's fault."""
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if tried:
+            _write_new(fd, TMP_ATTEMPTS, str(tried).encode("ascii"))
+        else:
+            os.unlink(TMP_ATTEMPTS, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def _stop(_signum, _frame) -> None:
+    with _LOCK:
+        running = list(_RUNNING.values())
+    for folder, tried in running:
+        try:
+            _take_back(folder, tried)
+        except OSError:
+            pass
+    os._exit(0)
 
 
 # --- finding work ---------------------------------------------------------------
@@ -236,24 +301,70 @@ def _work(folder: Path, converter: Converter) -> bool | None:
         return None
 
 
+def _tried(folder: Path) -> int:
+    try:
+        fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return 0
+    try:
+        return _attempts(fd)
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
+
+
+def _outer_gone(kit: Path) -> bool:
+    """True once the outer process no longer holds its lock. Its parent is the jail's runtime, which outlives it, and
+    a killed outer process its own parent has not reaped still answers a signal 0."""
+    try:
+        fd = os.open(kit / OUTER_LOCK, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
 def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Path) -> int:
-    """Answer requests until a converter raises, `RECYCLE_AFTER` files are done, or the outer process is gone."""
+    """Answer requests until a converter raises, `RECYCLE_AFTER` files are done, or the outer process is gone.
+
+    A folder an earlier inner process already tried runs alone, so a crash charges its attempt to that folder only.
+    """
     parent = os.getppid()
+    kit = scratch / KIT_DIR
+    kit.mkdir(exist_ok=True)
+    _KIT[:] = [kit]
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
     converter = factory({"engine": engine, "store": store, "scratch": scratch, "threads": threads})
     done, failed = 0, False
     running: dict[Future, str] = {}
+    alone: str | None = None
     skipped: set[str] = set()
     with ThreadPoolExecutor(max_workers=threads) as pool:
         while True:
-            if os.getppid() != parent:
-                return 0
+            if os.getppid() != parent or _outer_gone(kit):
+                # Not a return: leaving the pool waits for a convert that may never end.
+                os._exit(0)
             stopping = failed or done >= RECYCLE_AFTER
             if stopping and not running:
                 return RECYCLE_EXIT
-            if not stopping:
+            if not stopping and alone is None:
                 room = min(threads, RECYCLE_AFTER - done) - len(running)
-                for folder in pending(store, set(running.values()) | skipped)[: max(room, 0)]:
-                    running[pool.submit(_work, folder, converter)] = folder.name
+                waiting = pending(store, set(running.values()) | skipped)
+                suspects = [folder for folder in waiting if _tried(folder)]
+                if suspects:
+                    if not running:
+                        alone = suspects[0].name
+                        running[pool.submit(_work, suspects[0], converter)] = alone
+                else:
+                    for folder in waiting[: max(room, 0)]:
+                        running[pool.submit(_work, folder, converter)] = folder.name
             if not running:
                 skipped.clear()
                 time.sleep(SCAN_SECONDS)
@@ -261,6 +372,8 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
             finished, _ = wait(running, timeout=SCAN_SECONDS, return_when=FIRST_COMPLETED)
             for future in finished:
                 name = running.pop(future)
+                if name == alone:
+                    alone = None
                 outcome = future.result()
                 if outcome is None:
                     # A request that does not read waits for the next idle scan, not the next free worker.
@@ -268,6 +381,7 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
                     continue
                 done += 1
                 failed = failed or outcome
+                (kit / ANSWERED).touch()
 
 
 def _apply_env(scratch: Path, env: Mapping[str, str]) -> None:
@@ -361,31 +475,87 @@ def _outer(store: Path, scratch: Path, reads: Iterable[str | os.PathLike], unjai
         argv = _jail_argv(nono, store, scratch, _reads(reads))
     cwd = Path(sys.prefix).resolve()
     env = {**os.environ, INNER_ENV: "1"}
-    backoff = BACKOFF_SECONDS
+    backoff, crashes = BACKOFF_SECONDS, 0
     child: list[subprocess.Popen] = []
     stopping: list[int] = []
 
     def stop(signum, _frame) -> None:
         stopping.append(signum)
         if child and child[-1].poll() is None:
-            child[-1].send_signal(signum)
+            _signal_group(child[-1], signum)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     while not stopping:
         _wipe(scratch)
-        child.append(subprocess.Popen(argv, cwd=cwd, env=env))
-        code = child[-1].wait()
+        lock = _hold(scratch / KIT_DIR)
+        try:
+            # Its own process group, so a kill reaches the jail's runtime and the inner process both.
+            child.append(subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True))
+            code = _watch(child[-1], scratch / KIT_DIR, stopping)
+        finally:
+            os.close(lock)
         child.clear()
         if stopping:
             return 0
         if code == RECYCLE_EXIT:
-            backoff = BACKOFF_SECONDS
+            backoff, crashes = BACKOFF_SECONDS, 0
             continue
-        _say(f"the inner process exited {code}; starting another in {backoff:.0f}s")
+        crashes = 0 if (scratch / KIT_DIR / ANSWERED).exists() else crashes + 1
+        if crashes >= CRASH_LIMIT:
+            _say(f"{CRASH_LIMIT} inner processes in a row ended with no file answered; stopping")
+            return 1
+        _say(f"the inner process exited {code}; starting another in {backoff:g}s")
         time.sleep(backoff)
         backoff = min(backoff * 2, BACKOFF_CEILING)
     return 0
+
+
+def _hold(kit: Path) -> int:
+    kit.mkdir()
+    fd = os.open(kit / OUTER_LOCK, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _signal_group(child: subprocess.Popen, signum: int) -> None:
+    try:
+        os.killpg(child.pid, signum)
+    except ProcessLookupError:
+        pass
+
+
+def _overdue(kit: Path, now: float) -> str | None:
+    """The first running convert past its timeout, by the inner process's markers."""
+    try:
+        markers = [one for one in kit.iterdir() if one.name.startswith(CONVERTING)]
+    except OSError:
+        return None
+    for marker in markers:
+        try:
+            started = marker.lstat().st_mtime
+            timeout = float(marker.read_text(encoding="ascii")[:32])
+        except (OSError, ValueError):
+            continue
+        if now - started > timeout:
+            return marker.name[len(CONVERTING) :]
+    return None
+
+
+def _watch(child: subprocess.Popen, kit: Path, stopping: list[int]) -> int:
+    """Wait for the inner process; kill it where a convert runs past its timeout, which then counts as an attempt."""
+    while True:
+        try:
+            return child.wait(_POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        if stopping:
+            continue
+        late = _overdue(kit, time.time())
+        if late:
+            _say(f"{late}: the convert ran past its timeout; killing the inner process")
+            _signal_group(child, signal.SIGKILL)
+            return child.wait()
 
 
 def serve(
@@ -395,8 +565,12 @@ def serve(
     reads: Iterable[str | os.PathLike] = (),
     env: Mapping[str, str] | None = None,
     argv: list[str] | None = None,
+    timeout_seconds: float = TIMEOUT_SECONDS,
 ) -> int:
-    """Run the daemon for `engine` and answer its exit code; `argv` carries `--store`, `--cache`, `--unjailed`."""
+    """Run the daemon for `engine` and answer its exit code; `argv` carries `--store`, `--cache`, `--unjailed`.
+
+    `timeout_seconds` is a convert's time for a request whose options carry no `timeout_seconds` of their own.
+    """
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--store", required=True)
     parser.add_argument("--cache", required=True)
@@ -406,6 +580,7 @@ def serve(
     scratch = Path(args.cache).absolute() / "tmp"
     if os.environ.pop(INNER_ENV, "") == "1":
         _apply_env(scratch, env or {})
+        _DEFAULT_TIMEOUT[0] = float(timeout_seconds)
         return _inner(engine, factory, max(1, threads), store, scratch)
     store.mkdir(parents=True, exist_ok=True)
     return _outer(store, scratch, reads, args.unjailed)

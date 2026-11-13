@@ -35,10 +35,20 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--cache", required=True, help="<cache>/engines/<engine>; the scratch is its tmp/")
     run.add_argument("--factory", required=True, help="module:function that builds the converter")
     run.add_argument("--threads", type=int, default=1)
+    run.add_argument(
+        "--timeout-seconds", type=float, default=1800.0, help="a convert's time, unless its request's options name one"
+    )
     run.add_argument("--read", action="append", default=[], help="one more read-only tree for the jail")
     run.add_argument("--unjailed", action="store_true", help="skip the jail")
     args = parser.parse_args(argv)
-    return serve(Path(args.store).name, _lazy(args.factory), threads=args.threads, reads=args.read, argv=argv)
+    return serve(
+        Path(args.store).name,
+        _lazy(args.factory),
+        threads=args.threads,
+        reads=args.read,
+        argv=argv,
+        timeout_seconds=args.timeout_seconds,
+    )
 
 
 if __name__ == "__main__":
