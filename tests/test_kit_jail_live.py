@@ -83,3 +83,32 @@ def test_jailed_the_probe_reaches_none_of_them(live, listener):
     assert [line.split()[:2] for line in lines[:3]] == [["write", "refused"], ["connect", "refused"], ["home", "refused"]]
     assert lines[3] == "home-env True"
     assert not (live / "outside.txt").exists()
+
+
+def test_jailed_a_module_the_converter_plants_never_runs_in_the_next_inner_process(live):
+    store = live / "store"
+    marker = store / "planted-ran"
+    for name, options in (("a", {"plant": True, "marker": str(marker)}), ("b", {})):
+        folder = store / name
+        folder.mkdir(parents=True)
+        (folder / "body.txt").write_text("hello", encoding="utf-8")
+        (folder / "request.json").write_text(json.dumps({"body": "body.txt", "options": options}), encoding="utf-8")
+    argv = [sys.executable, "-m", "llm_wiki_engine_kit", "serve", "--store", str(store), "--cache", str(live / "cache")]
+    argv += ["--factory", "kitstubs:plant", "--read", str(TESTS)]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(KIT), str(TESTS)])}
+    proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        deadline = time.monotonic() + WAIT
+        while not (store / "b" / "result.json").exists():
+            if proc.poll() is not None:
+                pytest.fail(f"the daemon exited {proc.returncode}: {proc.communicate()[1].decode()[-2000:]}")
+            if time.monotonic() > deadline:
+                pytest.fail(f"no answer after {WAIT}s")
+            time.sleep(0.05)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+    assert json.loads((store / "a" / "result.json").read_text(encoding="utf-8"))["reason"] == "unreadable"
+    assert not marker.exists()
+    assert (store / "b" / "output.md").read_text(encoding="utf-8") == "# clean\n"

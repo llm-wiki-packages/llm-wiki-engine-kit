@@ -1,6 +1,8 @@
 """Stand-in factories the daemon tests name with `--factory kitstubs:<name>`."""
 
 import os
+import shutil
+import signal
 import socket
 import time
 from pathlib import Path
@@ -26,10 +28,11 @@ def echo(daemon):
 
 
 def raising(daemon):
-    """Leaves its pid in the scratch, then raises."""
+    """Appends its pid to the file `KIT_STUB_RECORD` names, then raises."""
 
     def convert(body: Path, out: Path, request: dict):
-        Path(os.environ["TMPDIR"], f"pid-{os.getpid()}").touch()
+        with open(os.environ["KIT_STUB_RECORD"], "a", encoding="utf-8") as held:
+            held.write(f"{os.getpid()}\n")
         raise RuntimeError("the parser broke")
 
     return convert
@@ -68,6 +71,44 @@ def probe(daemon):
             "home-env " + str(os.environ["HOME"] == os.environ["TMPDIR"]),
         ]
         out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return None
+
+    return convert
+
+
+def plant(daemon):
+    """With `plant` in the options, leaves a module named like the kit in the scratch and the cwd, then raises."""
+
+    def convert(body: Path, out: Path, request: dict):
+        options = request.get("options", {})
+        if not options.get("plant"):
+            out.write_text("# clean\n", encoding="utf-8")
+            return None
+        code = f"open({options['marker']!r}, 'w').write('ran')\n"
+        for root in {os.environ["TMPDIR"], os.getcwd()}:
+            planted = Path(root, "llm_wiki_engine_kit")
+            try:
+                planted.mkdir(exist_ok=True)
+                (planted / "__init__.py").write_text(code, encoding="utf-8")
+                (planted / "__main__.py").write_text(code, encoding="utf-8")
+            except OSError:
+                pass
+        raise RuntimeError("planted")
+
+    return convert
+
+
+def crash(daemon):
+    """`crash` in the options kills the process with SIGSEGV; `vanish` removes the folder mid-convert."""
+
+    def convert(body: Path, out: Path, request: dict):
+        options = request.get("options", {})
+        if options.get("crash"):
+            os.kill(os.getpid(), signal.SIGSEGV)
+        if options.get("vanish"):
+            shutil.rmtree(body.parent)
+            return None
+        out.write_text(body.read_text(encoding="utf-8"), encoding="utf-8")
         return None
 
     return convert

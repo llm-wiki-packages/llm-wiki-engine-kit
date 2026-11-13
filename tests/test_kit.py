@@ -1,6 +1,5 @@
 """The engine kit's daemon against a request store, unjailed, with stand-in converters."""
 
-import builtins
 import collections
 import json
 import os
@@ -144,32 +143,93 @@ def test_leftover_tmp_names_from_a_dead_daemon_are_written_over(tmp_path):
     assert not (tmp_path / "victim").exists()
 
 
-def test_the_daemon_never_writes_the_body_or_the_request(tmp_path, monkeypatch):
+def test_the_daemon_never_writes_the_body_or_the_request(tmp_path):
     folder = a_folder(tmp_path / "store", "k")
-    written = []
-    real_open, real_os_open = builtins.open, os.open
-    writes = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+    names = ("body.txt", "request.json")
 
-    def spy_open(file, mode="r", *args, **kwargs):
-        if any(flag in mode for flag in "wax+"):
-            written.append(os.path.basename(os.fsdecode(file)))
-        return real_open(file, mode, *args, **kwargs)
+    def held():
+        return {name: ((folder / name).read_bytes(), os.stat(folder / name)) for name in names}
 
-    def spy_os_open(path, flags, *args, **kwargs):
-        if flags & writes:
-            written.append(os.path.basename(os.fsdecode(path)))
-        return real_os_open(path, flags, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", spy_open)
-    monkeypatch.setattr(os, "open", spy_os_open)
+    before = held()
+    time.sleep(0.01)
 
     def convert(body, out, request):
         out.write_text("# text\n", encoding="utf-8")
 
     kit.answer(folder, kit.read_request(folder), convert)
-    assert written, "the spy saw no write at all"
-    assert not {"body.txt", "request.json"} & set(written)
-    assert (folder / "body.txt").read_text(encoding="utf-8") == "hello"
+    after = held()
+    for name in names:
+        assert after[name][0] == before[name][0], name
+        old, new = before[name][1], after[name][1]
+        assert (new.st_ino, new.st_mtime_ns, new.st_ctime_ns) == (old.st_ino, old.st_mtime_ns, old.st_ctime_ns), name
+
+
+def test_each_answer_file_is_synced_before_its_rename_and_the_folder_after(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k")
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        events.append(("fsync", os.fstat(fd).st_ino))
+        real_fsync(fd)
+
+    def replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        events.append(("replace", os.path.basename(os.fsdecode(dst))))
+        real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+
+    def convert(body, out, request):
+        out.write_text("# text\n", encoding="utf-8")
+
+    kit.answer(folder, kit.read_request(folder), convert)
+    output, result, where = ((folder / n).stat().st_ino for n in ("output.md", "result.json", "."))
+    replaced = [e for e in events if e[0] == "replace"]
+    assert replaced == [("replace", "output.md"), ("replace", "result.json")]
+    at = events.index(("replace", "output.md"))
+    last = events.index(("replace", "result.json"))
+    assert ("fsync", output) in events[:at]
+    assert ("fsync", where) in events[at:last]
+    assert ("fsync", result) in events[at:last]
+    assert ("fsync", where) in events[last:]
+
+
+def test_a_folder_tried_the_most_times_answers_unreadable_without_a_convert(tmp_path):
+    folder = a_folder(tmp_path / "store", "k")
+    calls = []
+
+    def convert(body, out, request):
+        calls.append(body)
+        out.write_text("# text\n", encoding="utf-8")
+
+    (folder / ".tmp-attempts").write_text(str(kit.MAX_ATTEMPTS), encoding="utf-8")
+    assert kit.answer(folder, kit.read_request(folder), convert) is False
+    assert calls == []
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+
+
+def test_each_attempt_is_counted_before_the_convert(tmp_path):
+    folder = a_folder(tmp_path / "store", "k")
+    seen = []
+
+    def convert(body, out, request):
+        seen.append((folder / ".tmp-attempts").read_text(encoding="utf-8"))
+        out.write_text("# text\n", encoding="utf-8")
+
+    kit.answer(folder, kit.read_request(folder), convert)
+    assert seen == ["1"]
+    assert not (folder / ".tmp-attempts").exists()
+
+
+def test_pythonpath_is_carried_only_inside_a_granted_tree(tmp_path, monkeypatch):
+    granted, other = tmp_path / "granted", tmp_path / "other"
+    (granted / "src").mkdir(parents=True)
+    other.mkdir()
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(granted / "src"), str(other), ".", "rel/dir"]))
+    assert kit._carried_pythonpath([granted]) == str((granted / "src").resolve())
+    assert str(other.resolve()) not in map(str, kit._reads([granted]))
+    assert Path.cwd().resolve() not in kit._reads([granted])
 
 
 # --- finding work, in process -------------------------------------------------
@@ -224,11 +284,12 @@ def test_the_factory_never_runs_in_the_outer_process(tmp_path, daemon):
 def test_after_an_exception_the_inner_process_exits_and_a_new_one_takes_the_next(tmp_path, daemon):
     store = tmp_path / "store"
     first, second = a_folder(store, "a"), a_folder(store, "b")
-    proc = daemon("raising")
+    record = tmp_path / "convert-pids"
+    proc = daemon("raising", env={"KIT_STUB_RECORD": str(record)})
     wait_for(second / "result.json", proc)
     assert result_of(first) == result_of(second) == {"reason": "unreadable", "traits": []}
-    pids = sorted(p.name for p in (tmp_path / "cache" / "tmp").iterdir() if p.name.startswith("pid-"))
-    assert len(pids) == 2, pids
+    pids = record.read_text(encoding="utf-8").split()
+    assert len(set(pids)) == 2, pids
 
 
 def test_after_fifty_files_the_inner_process_exits_and_a_new_one_answers_the_next(tmp_path, daemon):
@@ -264,6 +325,55 @@ def test_the_scratch_is_wiped_at_start_and_is_the_inner_home(tmp_path, daemon):
     wait_for(folder / "result.json", proc)
     assert not stale.exists()
     assert "home-env True" in (folder / "output.md").read_text(encoding="utf-8")
+
+
+def test_a_crashing_convert_is_tried_twice_then_answered_unreadable_and_the_next_folder_answered(tmp_path, daemon):
+    store = tmp_path / "store"
+    crashing = a_folder(store, "a", options={"crash": True})
+    fine = a_folder(store, "b", text="after")
+    proc = daemon("crash")
+    wait_for(fine / "result.json", proc)
+    wait_for(crashing / "result.json", proc)
+    assert result_of(crashing) == {"reason": "unreadable", "traits": []}
+    assert (fine / "output.md").read_text(encoding="utf-8") == "after"
+    assert proc.poll() is None
+
+
+def test_a_folder_removed_mid_convert_is_skipped_and_the_daemon_goes_on(tmp_path, daemon):
+    store = tmp_path / "store"
+    gone = a_folder(store, "a", options={"vanish": True})
+    fine = a_folder(store, "b", text="after")
+    proc = daemon("crash")
+    wait_for(fine / "result.json", proc)
+    assert not gone.exists()
+    assert proc.poll() is None
+
+
+def test_a_module_planted_in_the_scratch_or_the_cwd_never_runs(tmp_path, daemon):
+    store = tmp_path / "store"
+    marker = tmp_path / "planted-ran"
+    a_folder(store, "a", options={"plant": True, "marker": str(marker)})
+    after = a_folder(store, "b")
+    proc = daemon("plant")
+    wait_for(after / "result.json", proc)
+    assert not marker.exists()
+    assert (after / "output.md").read_text(encoding="utf-8") == "# clean\n"
+
+
+def test_an_engine_that_passes_its_own_argv_serves_and_does_not_re_exec_without_end(tmp_path):
+    folder = a_folder(tmp_path / "store", "k")
+    argv = ["--store", str(tmp_path / "store"), "--cache", str(tmp_path / "cache"), "--unjailed"]
+    code = f"import sys, kitstubs, llm_wiki_engine_kit as k; sys.exit(k.serve('stub', kitstubs.echo, argv={argv!r}))"
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(KIT), str(TESTS)])}
+    proc = subprocess.Popen([sys.executable, "-c", code], env=env, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 15
+        while not (folder / "result.json").exists() and time.monotonic() < deadline and proc.poll() is None:
+            time.sleep(0.05)
+        assert (folder / "result.json").exists()
+    finally:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
 
 
 def test_with_no_nono_the_jailed_daemon_exits_2_and_says_so(tmp_path, daemon):
