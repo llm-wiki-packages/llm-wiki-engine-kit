@@ -2,7 +2,7 @@
 name = "llm-wiki-engine-kit"
 version = "0.1.0"
 description = "Turns a convert function into a jailed daemon that serves the LLM-wiki engine request store"
-requires-python = ">=3.15"
+requires-python = ">=3.14"
 # Standard library only. An engine tool depends on the kit by path
 # (`[tool.uv.sources]`) or by git URL, so the kit installs into the engine's
 # own venv, and it has no artifact row and no console script of its own.
