@@ -483,6 +483,10 @@ def _import_root(factory: Factory) -> Path | None:
     """The directory the factory's top-level package imports from. An editable engine's code lies outside the
     interpreter's prefix, and the inner process imports it before the factory runs. Never the home or above it."""
     name = getattr(factory, "__module__", None) or ""
+    if name == "__main__":
+        # Under `python -m pkg`, the module is `__main__`; its spec still names the package it ran from.
+        spec = getattr(sys.modules.get(name), "__spec__", None)
+        name = getattr(spec, "name", None) or name
     for module in (sys.modules.get(name.split(".")[0]), sys.modules.get(name)):
         file = getattr(module, "__file__", None)
         if file:

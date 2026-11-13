@@ -260,6 +260,48 @@ def test_a_factory_imported_from_the_home_adds_no_read_of_the_home(tmp_path, mon
     assert kit._import_root(loose.factory) is None
 
 
+def _factory_module(path: Path, name: str, spec_name: str | None):
+    """A module as Python loads it, with `factory` defined in it and recorded under `name`."""
+    import importlib.util
+    import types
+
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    module.__spec__ = importlib.util.spec_from_file_location(spec_name, path) if spec_name else None
+    exec("def factory(daemon):\n    return None\n", module.__dict__)
+    return module
+
+
+@pytest.mark.unit
+def test_a_factory_imported_from_above_the_home_adds_no_read_of_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    module = _factory_module(tmp_path / "above.py", "above", "above")
+    monkeypatch.setitem(sys.modules, "above", module)
+    assert kit._import_root(module.factory) is None
+
+
+@pytest.mark.unit
+def test_a_single_file_module_grants_its_own_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "mods").mkdir()
+    module = _factory_module(tmp_path / "mods" / "solo.py", "solo", "solo")
+    monkeypatch.setitem(sys.modules, "solo", module)
+    assert kit._import_root(module.factory) == (tmp_path / "mods").resolve()
+
+
+@pytest.mark.unit
+def test_a_factory_in_a_package_run_with_dash_m_grants_the_folder_above_the_package(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    package = tmp_path / "src" / "eng"
+    package.mkdir(parents=True)
+    top = _factory_module(package / "__init__.py", "eng", "eng")
+    main = _factory_module(package / "__main__.py", "__main__", "eng.__main__")
+    monkeypatch.setitem(sys.modules, "eng", top)
+    monkeypatch.setitem(sys.modules, "__main__", main)
+    assert kit._import_root(main.factory) == (tmp_path / "src").resolve()
+
+
 # --- finding work, in process -------------------------------------------------
 
 
