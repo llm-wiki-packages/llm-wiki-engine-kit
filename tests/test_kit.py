@@ -1,6 +1,7 @@
 """The engine kit's daemon against a request store, unjailed, with stand-in converters."""
 
 import collections
+import contextlib
 import json
 import os
 import signal
@@ -399,6 +400,9 @@ def _alive(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat", encoding="ascii") as held:
             return held.read().rsplit(")", 1)[1].split()[0] != "Z"
+    # Reaped between the signal and the read.
+    except FileNotFoundError:
+        return False
     except OSError:
         return True
 
@@ -484,7 +488,8 @@ def test_when_the_outer_process_is_killed_the_converters_own_child_goes_too(tmp_
         assert _gone_within(child, 15), "the converter's child outlived the daemon"
     finally:
         if _alive(child):
-            os.kill(child, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child, signal.SIGKILL)
     assert not (folder / "result.json").exists()
 
 
