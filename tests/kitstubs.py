@@ -4,6 +4,7 @@ import os
 import shutil
 import signal
 import socket
+import threading
 import time
 from pathlib import Path
 
@@ -104,7 +105,8 @@ def crash(daemon):
     def convert(body: Path, out: Path, request: dict):
         options = request.get("options", {})
         if options.get("crash"):
-            os.kill(os.getpid(), signal.SIGSEGV)
+            # To this thread: `os.kill` lands on the main thread, and the worker could publish before the process dies.
+            signal.pthread_kill(threading.get_ident(), signal.SIGSEGV)
         if options.get("vanish"):
             shutil.rmtree(body.parent)
             return None
