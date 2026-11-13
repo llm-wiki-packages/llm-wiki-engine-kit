@@ -236,6 +236,29 @@ def test_pythonpath_is_carried_only_inside_a_granted_tree(tmp_path, monkeypatch)
     assert Path.cwd().resolve() not in kit._reads([granted])
 
 
+def test_the_jail_reads_the_tree_the_factorys_top_package_imports_from(tmp_path, monkeypatch):
+    root = tmp_path / "editable"
+    (root / "eng" / "sub").mkdir(parents=True)
+    (root / "eng" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "eng" / "sub" / "__init__.py").write_text("def factory(daemon):\n    return None\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(root))
+    import eng.sub
+
+    seen = []
+    monkeypatch.setattr(kit, "_outer", lambda store, scratch, reads, unjailed, timings: seen.extend(reads) or 0)
+    kit.serve("stub", eng.sub.factory, argv=["--store", str(tmp_path / "store"), "--cache", str(tmp_path / "cache")])
+    assert root.resolve() in [Path(one).resolve() for one in seen]
+
+
+def test_a_factory_imported_from_the_home_adds_no_read_of_the_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "loose.py").write_text("def factory(daemon):\n    return None\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    import loose
+
+    assert kit._import_root(loose.factory) is None
+
+
 # --- finding work, in process -------------------------------------------------
 
 

@@ -479,6 +479,20 @@ def _reads(extra: Iterable[str | os.PathLike]) -> list[Path]:
     return found
 
 
+def _import_root(factory: Factory) -> Path | None:
+    """The directory the factory's top-level package imports from. An editable engine's code lies outside the
+    interpreter's prefix, and the inner process imports it before the factory runs. Never the home or above it."""
+    name = getattr(factory, "__module__", None) or ""
+    for module in (sys.modules.get(name.split(".")[0]), sys.modules.get(name)):
+        file = getattr(module, "__file__", None)
+        if file:
+            path = Path(file).resolve()
+            root = path.parent.parent if path.name == "__init__.py" else path.parent
+            home = Path.home().resolve()
+            return None if root == home or root in home.parents else root
+    return None
+
+
 def _outer(store: Path, scratch: Path, reads: Iterable[str | os.PathLike], unjailed: bool, timings: Timings) -> int:
     """Start inner processes one after another until a signal; a crashed one is started again after a backoff.
 
@@ -629,4 +643,5 @@ def serve(
         _DEFAULT_TIMEOUT[0] = float(timeout_seconds)
         return _inner(engine, factory, max(1, threads), store, scratch, timings)
     store.mkdir(parents=True, exist_ok=True)
-    return _outer(store, scratch, reads, args.unjailed, timings)
+    root = _import_root(factory)
+    return _outer(store, scratch, [*reads, *([root] if root else [])], args.unjailed, timings)
