@@ -4,9 +4,18 @@ import os
 import shutil
 import signal
 import socket
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
+
+
+def _record(pid: int) -> None:
+    record = os.environ.get("KIT_STUB_RECORD")
+    if record:
+        with open(record, "a", encoding="utf-8") as held:
+            held.write(f"{pid}\n")
 
 
 def echo(daemon):
@@ -40,9 +49,10 @@ def raising(daemon):
 
 
 def stall(daemon):
-    """Writes half an output, then hangs: the test kills it mid-convert."""
+    """Writes half an output, then hangs: the test kills it mid-convert. Its pid goes to `KIT_STUB_RECORD`, if set."""
 
     def convert(body: Path, out: Path, request: dict):
+        _record(os.getpid())
         out.write_text("half", encoding="utf-8")
         time.sleep(600)
 
@@ -121,3 +131,20 @@ def crash(daemon):
 
 def broken(daemon):
     raise RuntimeError("the engine does not import")
+
+
+def deaf(daemon):
+    """Ignores SIGTERM in the inner process, then stalls like `stall`: only a SIGKILL ends it."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    return stall(daemon)
+
+
+def spawner(daemon):
+    """Starts a long child of its own, records the child's pid, then hangs."""
+
+    def convert(body: Path, out: Path, request: dict):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+        _record(child.pid)
+        time.sleep(600)
+
+    return convert

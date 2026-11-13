@@ -55,6 +55,9 @@ TIMEOUT_SECONDS = 1800.0
 # `outer.lock` is held by the outer process while the inner one runs: a free lock means the outer process is gone.
 KIT_DIR, ANSWERED, CONVERTING, OUTER_LOCK = ".kit", "answered", "converting-", "outer.lock"
 _POLL_SECONDS = 0.25
+# A stop the inner process has not finished in this long ends with a SIGKILL to its group.
+STOP_ESCALATE_SECONDS = 10.0
+_MARKER_CAP = 32
 UNREADABLE = {"reason": "unreadable", "traits": []}
 _BODY = re.compile(r"body(\.[A-Za-z0-9]+)*")
 _READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -66,7 +69,8 @@ Factory = Callable[[dict], Converter]
 # The inner process's running converts, `name -> (folder, attempts before this one)`, so a stop can take its counts
 # back; and where it leaves its markers, None outside an inner process.
 _RUNNING: dict[str, tuple[Path, int]] = {}
-_LOCK = threading.Lock()
+# Reentrant: a second signal can land in `_stop` while it holds the lock.
+_LOCK = threading.RLock()
 _KIT: list[Path] = []
 _DEFAULT_TIMEOUT = [TIMEOUT_SECONDS]
 
@@ -249,6 +253,8 @@ def _take_back(folder: Path, tried: int) -> None:
 
 
 def _stop(_signum, _frame) -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     with _LOCK:
         running = list(_RUNNING.values())
     for folder, tried in running:
@@ -349,8 +355,9 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
     with ThreadPoolExecutor(max_workers=threads) as pool:
         while True:
             if os.getppid() != parent or _outer_gone(kit):
-                # Not a return: leaving the pool waits for a convert that may never end.
-                os._exit(0)
+                # The whole group, not a return: leaving the pool waits for a convert that may never end, and a
+                # converter's own children would outlive an exit.
+                os.killpg(os.getpgrp(), signal.SIGKILL)
             stopping = failed or done >= RECYCLE_AFTER
             if stopping and not running:
                 return RECYCLE_EXIT
@@ -525,31 +532,56 @@ def _signal_group(child: subprocess.Popen, signum: int) -> None:
         pass
 
 
+def _marker(dir_fd: int, name: str) -> tuple[float, float] | None:
+    """A marker's start and timeout, read as the jail wrote it: never through a link, a FIFO or a large file."""
+    try:
+        fd = os.open(name, _READ, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        held = os.fstat(fd)
+        if not stat.S_ISREG(held.st_mode) or held.st_size > _MARKER_CAP:
+            return None
+        return held.st_mtime, float(os.read(fd, _MARKER_CAP).decode("ascii"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    finally:
+        os.close(fd)
+
+
 def _overdue(kit: Path, now: float) -> str | None:
     """The first running convert past its timeout, by the inner process's markers."""
     try:
-        markers = [one for one in kit.iterdir() if one.name.startswith(CONVERTING)]
+        dir_fd = os.open(kit, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return None
-    for marker in markers:
-        try:
-            started = marker.lstat().st_mtime
-            timeout = float(marker.read_text(encoding="ascii")[:32])
-        except (OSError, ValueError):
-            continue
-        if now - started > timeout:
-            return marker.name[len(CONVERTING) :]
+    try:
+        names = [one for one in os.listdir(dir_fd) if one.startswith(CONVERTING)]
+        for name in names:
+            found = _marker(dir_fd, name)
+            if found and now - found[0] > found[1]:
+                return name[len(CONVERTING) :]
+    except OSError:
+        return None
+    finally:
+        os.close(dir_fd)
     return None
 
 
 def _watch(child: subprocess.Popen, kit: Path, stopping: list[int]) -> int:
     """Wait for the inner process; kill it where a convert runs past its timeout, which then counts as an attempt."""
+    stop_seen: float | None = None
     while True:
         try:
             return child.wait(_POLL_SECONDS)
         except subprocess.TimeoutExpired:
             pass
         if stopping:
+            stop_seen = stop_seen or time.monotonic()
+            if time.monotonic() - stop_seen > STOP_ESCALATE_SECONDS:
+                _say(f"the inner process did not stop in {STOP_ESCALATE_SECONDS:g}s; killing it")
+                _signal_group(child, signal.SIGKILL)
+                return child.wait()
             continue
         late = _overdue(kit, time.time())
         if late:
