@@ -45,12 +45,56 @@ def make_converter(daemon: dict):
 serve(engine="docling", factory=make_converter, threads=1, reads=[...], env={...})
 ```
 
-- `daemon` holds `engine`, `store`, `scratch` and `threads`.
-- The converter gets the body's path, the path to write the markdown to,
-  and the request.
+- `daemon` holds `engine`, `sections`, `store`, `scratch` and `threads`.
+- `sections` are the request sections the engine serves. The default is
+  `("convert", "transcribe")`, the text sections. `serve` refuses a
+  section the host has no outputs for. A request for a section the engine
+  does not serve is answered `unsupported`, and never tried.
+- The converter gets the body's path, where to write, and the request. The
+  request's `section` says which section it is.
 - It answers `None` for a converted file. For a file it did not convert, it
   answers `{"reason": <reason>, "traits": [...]}`.
 - An exception answers `{"reason": "unreadable", "traits": []}`.
+
+What the converter writes depends on the section:
+
+| Section | Where to write | Files |
+| :-- | :-- | :-- |
+| `convert`, `transcribe` | a file path | the markdown, UTF-8 |
+| `narrate` | an empty folder | `output.mp3`, and `output.vtt` if it has a transcript |
+
+A narrate engine serves only that section:
+
+```python
+def make_narrator(daemon: dict):
+    import tts  # imported inside the jail
+    def narrate(body: Path, out: Path, request: dict) -> dict | None:
+        options = request["options"]  # voice, cast, pronounce, tags
+        tts.speak(body.read_text(), out / "output.mp3", out / "output.vtt", **options)
+        return None
+    return narrate
+
+serve(engine="kokoro", factory=make_narrator, sections=["narrate"], reads=[...])
+```
+
+The narrate body, `body.txt`, is the text to speak, in UTF-8. A podcast's
+lines can carry a `<v Label>` speaker tag. The converter can leave other
+files in the folder; the kit removes them.
+
+The kit checks each file as the host checks it, before it publishes any.
+It answers a reason, and publishes nothing, where the host would refuse
+a file:
+
+| File | Cap | Must |
+| :-- | :-- | :-- |
+| `output.md` | 64 MiB + 64 KiB | be UTF-8 |
+| `output.mp3` | 512 MiB | open with an ID3 tag or an MPEG frame sync |
+| `output.vtt` | 64 MiB + 64 KiB | be UTF-8 and open with `WEBVTT` (a byte order mark first is allowed) |
+
+- A file past its cap answers `too_large`.
+- A file that fails another check answers `unreadable`. So does a file
+  that is not a regular file with one name (a link, a hard link, a FIFO),
+  and a narrate answer with no `output.mp3`.
 - `serve` reads `--store <dir>`, `--cache <dir>` and `--unjailed` from
   `argv` (default `sys.argv[1:]`). It ignores other arguments, so the
   engine can parse its own.
@@ -62,8 +106,10 @@ serve(engine="docling", factory=make_converter, threads=1, reads=[...], env={...
 To try a converter by hand:
 
 ```sh
-python -m llm_wiki_engine_kit serve --store <dir> --cache <dir> --factory <module:function> [--read <dir>] [--unjailed]
+python -m llm_wiki_engine_kit serve --store <dir> --cache <dir> --factory <module:function> [--section <section>] [--read <dir>] [--unjailed]
 ```
+
+Repeat `--section` for each section the engine serves.
 
 ## The jail
 
@@ -80,7 +126,8 @@ The jail grants:
   directory above it.
 - write: the engine's request store (`--store`), and one scratch
   directory, `<cache>/tmp/`. The outer process wipes the scratch before
-  each start.
+  each start. A converter writes its outputs only in its request folder's
+  `.tmp-` names, which are in the store.
 - the system paths that nono's default groups grant. These include the
   system temp directory (`/tmp`), which the jail can write.
 
@@ -131,8 +178,8 @@ What the daemon does:
    followed.
 2. **Read the request.** It reads `request.json` with `O_NOFOLLOW` and a
    64 KiB cap. It skips a folder whose request is a link, is not a regular
-   file, or is off its shape. It never writes `body<suffix>` or
-   `request.json`.
+   file, or is off its shape. A request with no `section` is a `convert`.
+   It never writes `body<suffix>` or `request.json`.
 3. **Wait for the body.** It converts only when two scans in a row see
    the body unchanged (inode, size, mtime and ctime), its ctime is at
    least 2 seconds old, and its sha256 is the request's `sha256`. Until
@@ -148,17 +195,29 @@ What the daemon does:
      never hashed.
    - The hash reads the whole body. On a store that streams files on
      demand, that read can block. Use Google Drive in mirror mode only.
-4. **Convert.** It calls the converter in one of `threads` workers.
-5. **Answer, result last.** It writes `output.md` for a converted file,
-   then `result.json`. It writes each under a `.tmp-` name first, then
-   renames it into place. A converted answer's `result.json` maps each
-   output file to its sha256 and size:
-   `"outputs": {"output.md": {"sha256": "...", "size": 123}}`. The host
-   lands it only when every listed file is present and matches.
+4. **Convert.** It calls the converter in one of `threads` workers. A
+   text section's converter writes `.tmp-output.md`. A media section's
+   converter writes into the folder `.tmp-out/`, which the kit makes empty
+   in the request folder.
+5. **Check.** It checks every output file (the table in "The contract"),
+   before it publishes any. It reads each file's sha256 and size from the
+   one inode it opened, never through a link.
+6. **Answer, result last.** It renames each output file into place, then
+   writes `result.json`. A text answer has `output.md`. A narrate answer
+   has `output.mp3`, then `output.vtt` if there is one. After each rename
+   it checks that the name holds the inode it read; if not, it removes what
+   it published and answers `unreadable`. It writes `result.json` under a
+   `.tmp-` name first, then renames it into place. A converted answer's
+   `result.json` maps each output file to its sha256 and size:
+   `"outputs": {"output.md": {"sha256": "...", "size": 123}}`, or
+   `"outputs": {"output.mp3": {...}, "output.vtt": {...}}`. The host lands
+   it only when every listed file is present and matches.
 
-The daemon writes only `output.md`, `result.json` and its own `.tmp-`
-names. It never reads or removes any other name in a request folder. The
-`.tmp-` names can sync to the host; the host never reads them.
+The daemon writes only the section's output files, `result.json` and its
+own `.tmp-` names. It removes its `.tmp-` names before it writes
+`result.json`, except `.tmp-attempts`, which it removes after. It never
+reads or removes any other name in a request folder. The `.tmp-` names can
+sync to the host; the host never reads them.
 
 How it handles failures:
 

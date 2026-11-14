@@ -161,3 +161,31 @@ def test_jailed_an_inner_process_whose_outer_was_killed_ends_when_a_new_outer_ta
         if orphan is not None:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(os.getpgid(orphan), signal.SIGKILL)
+
+
+def test_jailed_a_narrate_converter_writes_its_audio_into_the_requests_out_folder(live):
+    store = live / "store"
+    folder = request_folder(store, "k", {})
+    request = json.loads((folder / "request.json").read_text(encoding="utf-8"))
+    (folder / "request.json").write_text(json.dumps({**request, "section": "narrate"}), encoding="utf-8")
+    argv = [sys.executable, "-m", "llm_wiki_engine_kit", "serve", "--store", str(store), "--cache", str(live / "cache")]
+    argv += ["--factory", "kitstubs:narrator", "--section", "narrate", "--read", str(TESTS)]
+    argv += ["--scan-seconds", "0.05", "--poll-seconds", "0.05"]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(KIT), str(TESTS)])}
+    proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        deadline = time.monotonic() + WAIT
+        while not (folder / "result.json").exists():
+            if proc.poll() is not None:
+                pytest.fail(f"the daemon exited {proc.returncode}: {proc.communicate()[1].decode()[-2000:]}")
+            if time.monotonic() > deadline:
+                pytest.fail(f"no answer after {WAIT}s")
+            time.sleep(0.05)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+    result = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+    assert set(result["outputs"]) == {"output.mp3", "output.vtt"}
+    assert (folder / "output.mp3").read_bytes().startswith(b"ID3")
+    assert not (folder / ".tmp-out").exists()

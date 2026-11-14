@@ -41,13 +41,15 @@ def key_of(name: str) -> str:
     return name.encode("utf-8").hex().ljust(64, "0")
 
 
-def a_folder(store: Path, name: str, text: str = "hello", *, options=None, machine: str = MACHINE) -> Path:
+def a_folder(
+    store: Path, name: str, text: str = "hello", *, options=None, machine: str = MACHINE, section: str = "convert"
+) -> Path:
     """A request folder at `<store>/<machine>/<key>/`, as a host submits it."""
     folder = store / machine / key_of(name)
     folder.mkdir(parents=True)
     (folder / "body.txt").write_text(text, encoding="utf-8")
     sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    request = {"v": 1, "engine": "stub", "section": "convert", "sha256": sha, "body": "body.txt"}
+    request = {"v": 1, "engine": "stub", "section": section, "sha256": sha, "body": "body.txt"}
     (folder / "request.json").write_text(json.dumps({**request, "options": options or {}}), encoding="utf-8")
     return folder
 
@@ -548,6 +550,224 @@ def test_a_request_whose_body_leaves_the_folder_does_not_read(tmp_path):
     assert kit.read_request(folder) is None
 
 
+# --- a media section: narrate ---------------------------------------------------
+
+MP3_BYTES = b"ID3\x04\x00\x00\x00\x00\x00\x00audio"
+VTT_TEXT = "WEBVTT\n\n00:00.000 --> 00:01.000\n<v Host>hello\n"
+
+
+def listed(**files: bytes) -> dict:
+    return {
+        name.replace("_", "."): {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+        for name, data in files.items()
+    }
+
+
+def narrated(folder: Path, convert, sections=("narrate",)) -> bool:
+    return kit.answer(folder, kit.read_request(folder), convert, sections=sections)
+
+
+def speaker(mp3: bytes | None = MP3_BYTES, vtt: bytes | None = VTT_TEXT.encode("utf-8")):
+    def convert(body, out, request):
+        assert out.is_dir() and not any(out.iterdir())
+        if mp3 is not None:
+            (out / "output.mp3").write_bytes(mp3)
+        if vtt is not None:
+            (out / "output.vtt").write_bytes(vtt)
+
+    return convert
+
+
+def test_a_narrate_answer_publishes_mp3_and_vtt_before_result_json(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    order = []
+    real = os.replace
+
+    def replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        order.append(os.path.basename(os.fsdecode(dst)))
+        real(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "replace", replace)
+    assert narrated(folder, speaker()) is False
+    assert order == ["output.mp3", "output.vtt", "result.json"]
+    vtt = VTT_TEXT.encode("utf-8")
+    assert result_of(folder) == {"reason": None, "traits": [], "outputs": listed(output_mp3=MP3_BYTES, output_vtt=vtt)}
+    assert (folder / "output.mp3").read_bytes() == MP3_BYTES
+    names = sorted(p.name for p in folder.iterdir())
+    assert names == ["body.txt", "output.mp3", "output.vtt", "request.json", "result.json"]
+
+
+def test_a_narrate_answer_with_no_transcript_lists_the_mp3_alone(tmp_path):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    frame = b"\xff\xfb\x90\x00" + b"\x00" * 16
+    narrated(folder, speaker(mp3=frame, vtt=None))
+    assert result_of(folder) == {"reason": None, "traits": [], "outputs": listed(output_mp3=frame)}
+
+
+@pytest.mark.parametrize(
+    "mp3, vtt",
+    [
+        (None, VTT_TEXT.encode()),
+        (b"RIFF....WAVE", None),
+        (b"", None),
+        (MP3_BYTES, b"NOTVTT\n"),
+        (MP3_BYTES, b"WEBVTT\n\xff\xfe"),
+        (MP3_BYTES, b""),
+    ],
+    ids=["no-mp3", "wav-not-mp3", "empty-mp3", "vtt-no-header", "vtt-not-utf8", "empty-vtt"],
+)
+def test_an_output_the_host_would_refuse_answers_unreadable_and_publishes_nothing(tmp_path, mp3, vtt):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    narrated(folder, speaker(mp3=mp3, vtt=vtt))
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+    assert sorted(p.name for p in folder.iterdir()) == ["body.txt", "request.json", "result.json"]
+
+
+def test_a_vtt_that_opens_with_a_byte_order_mark_is_published(tmp_path):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    vtt = b"\xef\xbb\xbf" + VTT_TEXT.encode("utf-8")
+    narrated(folder, speaker(vtt=vtt))
+    assert result_of(folder)["outputs"] == listed(output_mp3=MP3_BYTES, output_vtt=vtt)
+
+
+def test_an_mp3_past_the_hosts_cap_answers_too_large(tmp_path, monkeypatch):
+    monkeypatch.setitem(kit.OUTPUT_CAPS, "output.mp3", len(MP3_BYTES) - 1)
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    narrated(folder, speaker())
+    assert result_of(folder) == {"reason": "too_large", "traits": []}
+    assert not (folder / "output.mp3").exists() and not (folder / "output.vtt").exists()
+
+
+def test_the_hosts_caps_are_the_kits():
+    text = 4 * 16 * 2**20 + 64 * 2**10
+    assert kit.OUTPUT_CAPS == {"output.md": text, "output.mp3": 512 * 2**20, "output.vtt": text}
+    narrate = ("output.mp3", "output.vtt")
+    assert kit.SECTION_OUTPUTS == {"convert": ("output.md",), "transcribe": ("output.md",), "narrate": narrate}
+
+
+@pytest.mark.parametrize("kind", ["link", "hardlink", "dir", "fifo"])
+def test_an_output_that_is_not_a_file_of_one_name_answers_unreadable(tmp_path, kind):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    outside = tmp_path / "outside.mp3"
+    outside.write_bytes(MP3_BYTES)
+
+    def convert(body, out, request):
+        mp3 = out / "output.mp3"
+        if kind == "link":
+            mp3.symlink_to(outside)
+        elif kind == "hardlink":
+            os.link(outside, mp3)
+        elif kind == "dir":
+            mp3.mkdir()
+        else:
+            os.mkfifo(mp3)
+
+    narrated(folder, convert)
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+    assert not (folder / "output.mp3").exists()
+    assert outside.read_bytes() == MP3_BYTES
+
+
+def test_an_output_swapped_after_its_check_is_never_published_under_the_digest(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    real = os.replace
+
+    def replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        if os.fsdecode(dst) == "output.mp3":
+            os.unlink(src, dir_fd=src_dir_fd)
+            fd = os.open(src, os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=src_dir_fd)
+            os.write(fd, b"ID3 forged")
+            os.close(fd)
+        real(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "replace", replace)
+    narrated(folder, speaker())
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+    assert not (folder / "output.mp3").exists() and not (folder / "output.vtt").exists()
+
+
+def test_the_converters_other_files_and_a_stale_out_dir_are_cleared(tmp_path):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "keep").write_text("x")
+    (folder / ".tmp-out").symlink_to(victim)
+
+    def convert(body, out, request):
+        assert not out.is_symlink()
+        speaker()(body, out, request)
+        (out / "scratch.wav").write_bytes(b"x")
+
+    narrated(folder, convert)
+    assert result_of(folder)["reason"] is None
+    assert not (folder / ".tmp-out").exists()
+    assert (victim / "keep").read_text() == "x"
+
+
+def test_the_converter_writes_its_audio_into_a_tmp_folder_of_the_request(tmp_path):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    seen = []
+
+    def convert(body, out, request):
+        seen.append(out)
+        speaker()(body, out, request)
+
+    narrated(folder, convert)
+    assert seen == [folder / ".tmp-out"]
+
+
+@pytest.mark.parametrize(
+    "section, sections", [("narrate", ("convert", "transcribe")), ("convert", ("narrate",)), ("summarize", ("convert",))]
+)
+def test_a_section_the_engine_does_not_serve_answers_unsupported_without_a_convert(tmp_path, section, sections):
+    folder = a_folder(tmp_path / "store", "k", section=section)
+    calls = []
+    assert narrated(folder, lambda body, out, request: calls.append(out), sections=sections) is False
+    assert calls == []
+    assert result_of(folder) == {"reason": "unsupported", "traits": []}
+    assert not (folder / ".tmp-attempts").exists()
+
+
+def test_a_text_engine_serves_convert_and_transcribe_by_default(tmp_path):
+    for name, section in (("a", "convert"), ("b", "transcribe")):
+        folder = a_folder(tmp_path / "store", name, section=section)
+        kit.answer(folder, kit.read_request(folder), lambda body, out, request: out.write_text("# t\n") and None)
+        assert result_of(folder) == converted("# t\n")
+
+
+def test_a_request_with_no_section_is_a_convert(tmp_path):
+    folder = a_folder(tmp_path / "store", "k")
+    request = json.loads((folder / "request.json").read_text())
+    del request["section"]
+    (folder / "request.json").write_text(json.dumps(request))
+    kit.answer(folder, kit.read_request(folder), lambda body, out, request: out.write_text("# t\n") and None)
+    assert result_of(folder) == converted("# t\n")
+
+
+def test_a_request_whose_section_is_not_a_word_does_not_read(tmp_path):
+    folder = a_folder(tmp_path / "store", "k")
+    request = json.loads((folder / "request.json").read_text())
+    (folder / "request.json").write_text(json.dumps({**request, "section": ["narrate"]}))
+    assert kit.read_request(folder) is None
+
+
+def test_an_output_md_the_host_would_refuse_is_not_published(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k")
+    kit.answer(folder, kit.read_request(folder), lambda body, out, request: out.write_bytes(b"\xff\xfe") and None)
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+    assert not (folder / "output.md").exists() and not (folder / ".tmp-output.md").exists()
+    monkeypatch.setitem(kit.OUTPUT_CAPS, "output.md", 3)
+    other = a_folder(tmp_path / "store", "m")
+    kit.answer(other, kit.read_request(other), lambda body, out, request: out.write_text("# long\n") and None)
+    assert result_of(other) == {"reason": "too_large", "traits": []}
+
+
+def test_serve_refuses_a_section_the_host_has_no_outputs_for(tmp_path):
+    with pytest.raises(ValueError, match="summarize"):
+        argv = ["--store", str(tmp_path), "--cache", str(tmp_path)]
+        kit.serve("stub", lambda daemon: None, sections=("summarize",), argv=argv)
+
+
 # --- the daemon, spawned ------------------------------------------------------
 
 
@@ -916,3 +1136,11 @@ def test_with_no_nono_the_jailed_daemon_exits_2_and_says_so(tmp_path, daemon):
     out, err = proc.communicate(timeout=WAIT)
     assert proc.returncode == 2
     assert b"no nono on PATH" in err
+
+
+def test_a_narrate_engine_answers_with_its_audio(tmp_path, daemon):
+    folder = a_folder(tmp_path / "store", "k", "<v Host>hello", section="narrate")
+    proc = daemon("narrator", "--section", "narrate")
+    wait_for(folder / "result.json", proc)
+    assert set(result_of(folder)["outputs"]) == {"output.mp3", "output.vtt"}
+    assert (folder / "output.vtt").read_text(encoding="utf-8") == "WEBVTT\n\n00:00.000 --> 00:01.000\n<v Host>hello\n"
