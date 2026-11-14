@@ -4,13 +4,32 @@ version = "0.1.0"
 description = "Turns a convert function into a jailed daemon that serves the LLM-wiki engine request store"
 requires-python = ">=3.14"
 # Standard library only. An engine tool depends on the kit by a git URL
-# pinned to one commit, so the kit installs into the engine's
-# own venv, and it has no artifact row and no console script of its own.
+# pinned to a release tag, so the kit installs into the engine's own venv.
+# It has no console script of its own.
 dependencies = []
+license = "MIT"
+
+[project.urls]
+Repository = "https://github.com/llm-wiki-packages/llm-wiki-engine-kit"
+
+[dependency-groups]
+dev = ["pytest>=8,!=9.1.0,!=9.1.1", "pytest-timeout>=2"]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["llm_wiki_engine_kit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The tests import `kitstubs` by name, and start daemons that import it too.
+pythonpath = [".", "tests"]
+addopts = "--import-mode=importlib"
+# A hang is a red, not a hung job.
+timeout = 120
+markers = [
+    "sandbox: runs the real jail, so it needs nono on PATH and a kernel that enforces it",
+    "unit: starts no child process",
+]

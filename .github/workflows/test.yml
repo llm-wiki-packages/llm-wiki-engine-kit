@@ -1,0 +1,38 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # GitHub's hosted Ubuntu kernel has Landlock, so nono can enforce the
+    # jail and the `sandbox` rows run here too.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NONO_VERSION: "0.81.0"
+      NONO_SHA256: "7ecc33ff9c349bdfa84b4496e7a7555f67bcc33f1e125c7df9efb653c6c4e569"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+      # The release tarball at a pinned version, checked against its sha256.
+      - name: Install nono
+        run: |
+          url="https://github.com/nolabs-ai/nono/releases/download/v$NONO_VERSION/nono-v$NONO_VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL --max-time 120 -o "$RUNNER_TEMP/nono.tar.gz" "$url"
+          echo "$NONO_SHA256  $RUNNER_TEMP/nono.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/nono"
+          tar -xzf "$RUNNER_TEMP/nono.tar.gz" -C "$RUNNER_TEMP/nono"
+          sudo install -m 0755 "$(find "$RUNNER_TEMP/nono" -type f -name nono -perm -u+x | head -1)" /usr/local/bin/nono
+          nono --version
+      - name: Run the tests
+        run: uv run pytest -q

@@ -231,6 +231,7 @@ def test_pythonpath_is_carried_only_inside_a_granted_tree(tmp_path, monkeypatch)
     granted, other = tmp_path / "granted", tmp_path / "other"
     (granted / "src").mkdir(parents=True)
     other.mkdir()
+    monkeypatch.chdir(other)
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(granted / "src"), str(other), ".", "rel/dir"]))
     assert kit._carried_pythonpath([granted]) == str((granted / "src").resolve())
     assert str(other.resolve()) not in map(str, kit._reads([granted]))
