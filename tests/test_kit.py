@@ -52,6 +52,12 @@ def a_folder(store: Path, name: str, text: str = "hello", *, options=None, machi
     return folder
 
 
+def kill_group(pid: int) -> None:
+    """A teardown's kill. On macOS, `killpg` answers EPERM, not ESRCH, for a group that holds only zombies."""
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, signal.SIGKILL)
+
+
 def converted(text: str) -> dict:
     data = text.encode("utf-8")
     return {"reason": None, "traits": [], "outputs": {"output.md": {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}}}
@@ -89,7 +95,7 @@ def daemon(tmp_path):
     yield start
     for proc in started:
         if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)
+            kill_group(proc.pid)
         proc.communicate()
 
 
@@ -709,10 +715,15 @@ def test_a_stop_takes_back_the_attempt_of_the_folder_in_progress(tmp_path, daemo
 
 
 def _alive(pid: int) -> bool:
+    """True while the process runs: a zombie, unreaped, still answers a signal 0."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
+    if not Path("/proc/self").exists():
+        # macOS has no /proc: `ps` prints the state, and nothing once the process is reaped.
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        return bool(state) and not state.startswith("Z")
     try:
         with open(f"/proc/{pid}/stat", encoding="ascii") as held:
             return held.read().rsplit(")", 1)[1].split()[0] != "Z"
@@ -905,7 +916,7 @@ def test_an_engine_that_passes_its_own_argv_serves_and_does_not_re_exec_without_
             time.sleep(0.05)
         assert (folder / "result.json").exists()
     finally:
-        os.killpg(proc.pid, signal.SIGKILL)
+        kill_group(proc.pid)
         proc.communicate()
 
 
