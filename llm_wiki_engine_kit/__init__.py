@@ -68,6 +68,12 @@ _BODY = re.compile(r"body(\.[A-Za-z0-9]+)*")
 _MACHINE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _KEY = _SHA256 = re.compile(r"[0-9a-f]{64}")
 _CHUNK = 1024 * 1024
+_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# The largest body a host copies into the store; a larger one is answered `too_large`, never hashed or converted.
+MAX_BODY_BYTES = 2 * 1024 * 1024 * 1024
+TOO_LARGE = {"reason": "too_large", "traits": []}
+# A digest of a body whose mtime is this recent is not cached: a write in the same mtime tick would not show.
+RACY_SECONDS = 2.0
 _READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _WRITE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -102,12 +108,32 @@ def _say(message: str) -> None:
 # --- one request ----------------------------------------------------------------
 
 
+def folder_fd(folder: Path) -> int:
+    """`<store>/<machine>/<key>/` opened level by level from the store, never through a link: a segment or a folder
+    swapped for a link after the scan raises `OSError`."""
+    top = os.open(folder.parent.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        segment = os.open(folder.parent.name, _DIR, dir_fd=top)
+    finally:
+        os.close(top)
+    try:
+        return os.open(folder.name, _DIR, dir_fd=segment)
+    finally:
+        os.close(segment)
+
+
 def read_request(folder: Path) -> dict | None:
     """The folder's `request.json`, or None where it is a link, not a regular file, over the cap or off its shape."""
     try:
-        fd = os.open(folder / REQUEST, _READ)
+        held = folder_fd(folder)
     except OSError:
         return None
+    try:
+        fd = os.open(REQUEST, _READ, dir_fd=held)
+    except OSError:
+        return None
+    finally:
+        os.close(held)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
@@ -136,34 +162,67 @@ def ident(folder: Path) -> str:
     return f"{folder.parent.name}.{folder.name}"
 
 
-# The body's sha256 by `(device, inode, size, mtime_ns)`, so a body still syncing is hashed once per change.
+# A body is seen as `(device, inode, size, mtime_ns)`. The last sight per folder, so a body is hashed only once two
+# scans in a row see it alike; and each digest by its sight, so a body that holds still is hashed once.
+_SEEN: dict[str, tuple[int, int, int, int]] = {}
 _HASHED: dict[tuple[int, int, int, int], str] = {}
+_MEMO_CAP = 4096
 
 
-def body_arrived(folder: Path, request: dict) -> bool:
-    """Whether the folder's body is a regular file whose sha256 is the request's. A sync tool carries the body and
-    `request.json` in any order, and a body half written: until it matches, the request waits, never answered."""
+def _remember(memo: dict, key, value) -> None:
+    if len(memo) >= _MEMO_CAP:
+        memo.clear()
+    memo[key] = value
+
+
+def ready(folder: Path) -> bool:
+    """Whether the folder's request is one to answer now. A sync tool carries the body and `request.json` in any order,
+    and a body half written, so a regular body is ready only once two scans in a row see it alike and its sha256 is
+    the request's; until then the request waits, never tried nor answered. A body that is not a regular file, or past
+    `MAX_BODY_BYTES`, is ready at once: its answer is `unreadable` or `too_large`."""
+    request = read_request(folder)
+    if request is None:
+        return False
     try:
-        fd = os.open(folder / request["body"], _READ)
+        fd = folder_fd(folder)
     except OSError:
         return False
     try:
-        held = os.fstat(fd)
-        if not stat.S_ISREG(held.st_mode):
+        try:
+            held = os.stat(request["body"], dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
             return False
+        if not stat.S_ISREG(held.st_mode) or held.st_size > MAX_BODY_BYTES:
+            return True
         seen = (held.st_dev, held.st_ino, held.st_size, held.st_mtime_ns)
-        if seen not in _HASHED:
-            digest = hashlib.sha256()
-            while chunk := os.read(fd, _CHUNK):
-                digest.update(chunk)
-            if len(_HASHED) > 4096:
-                _HASHED.clear()
-            _HASHED[seen] = digest.hexdigest()
-        return _HASHED[seen] == request["sha256"]
+        if _SEEN.get(ident(folder)) != seen:
+            _remember(_SEEN, ident(folder), seen)
+            return False
+        digest = _HASHED.get(seen) or _hash(fd, request["body"], seen)
+        return digest == request["sha256"]
     except OSError:
         return False
     finally:
         os.close(fd)
+
+
+def _hash(fd: int, name: str, seen: tuple[int, int, int, int]) -> str | None:
+    """The body's sha256 where it is still the file `seen` describes; cached only where its mtime is more than
+    `RACY_SECONDS` old, since a write inside one mtime tick leaves `seen` alike."""
+    body = os.open(name, _READ, dir_fd=fd)
+    try:
+        held = os.fstat(body)
+        if (held.st_dev, held.st_ino, held.st_size, held.st_mtime_ns) != seen:
+            return None
+        digest = hashlib.sha256()
+        while chunk := os.read(body, _CHUNK):
+            digest.update(chunk)
+    finally:
+        os.close(body)
+    found = digest.hexdigest()
+    if time.time() - seen[3] / 1e9 > RACY_SECONDS:
+        _remember(_HASHED, seen, found)
+    return found
 
 
 def _digest(fd: int, name: str) -> tuple[str, int]:
@@ -248,7 +307,7 @@ def answer(folder: Path, request: dict, converter: Converter) -> bool:
     before the convert, so a convert that kills the process is tried `MAX_ATTEMPTS` times, then answered `unreadable`.
     The body and `request.json` are never written.
     """
-    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    fd = folder_fd(folder)
     try:
         try:
             os.unlink(TMP_OUTPUT, dir_fd=fd)
@@ -261,6 +320,8 @@ def answer(folder: Path, request: dict, converter: Converter) -> bool:
             result = UNREADABLE
         elif not _regular(fd, request["body"]):
             result = UNREADABLE
+        elif os.stat(request["body"], dir_fd=fd, follow_symlinks=False).st_size > MAX_BODY_BYTES:
+            result = TOO_LARGE
         else:
             _write_new(fd, TMP_ATTEMPTS, str(tried + 1).encode("ascii"))
             _started(folder, tried, request)
@@ -315,7 +376,7 @@ def _ended(folder: Path) -> None:
 
 def _take_back(folder: Path, tried: int) -> None:
     """Set a running folder's count back to what it held before this attempt: a stop is not the file's fault."""
-    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    fd = folder_fd(folder)
     try:
         if tried:
             _write_new(fd, TMP_ATTEMPTS, str(tried).encode("ascii"))
@@ -380,10 +441,10 @@ def pending(store: Path, busy: set[str]) -> list[Path]:
 
 
 def _work(folder: Path, converter: Converter) -> bool | None:
-    """One folder's answer; None where its request does not read or its body has not arrived whole, or the folder went
-    away mid-answer (a host prune)."""
+    """One folder's answer; None where its request does not read, or the folder went away or turned into a link
+    mid-answer (a host prune). The main thread asked `ready` first."""
     request = read_request(folder)
-    if request is None or not body_arrived(folder, request):
+    if request is None:
         return None
     try:
         return answer(folder, request, converter)
@@ -394,7 +455,7 @@ def _work(folder: Path, converter: Converter) -> bool | None:
 
 def _tried(folder: Path) -> int:
     try:
-        fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = folder_fd(folder)
     except OSError:
         return 0
     try:
@@ -425,6 +486,8 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
     """Answer requests until a converter raises, `RECYCLE_AFTER` files are done, or the outer process is gone.
 
     A folder an earlier inner process already tried runs alone, so a crash charges its attempt to that folder only.
+    A folder not `ready`, or whose request did not read, is passed over until the next scan, so a store full of
+    requests still syncing costs one scan per `timings.scan`, not one per folder.
     """
     parent = os.getppid()
     kit = scratch / KIT_DIR
@@ -437,6 +500,7 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
     running: dict[Future, str] = {}
     alone: str | None = None
     skipped: set[str] = set()
+    cleared = time.monotonic()
     with ThreadPoolExecutor(max_workers=threads) as pool:
         while True:
             if os.getppid() != parent or _outer_gone(kit):
@@ -447,8 +511,16 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
             if stopping and not running:
                 return RECYCLE_EXIT
             if not stopping and alone is None:
+                if time.monotonic() - cleared >= timings.scan:
+                    skipped.clear()
+                    cleared = time.monotonic()
                 room = min(threads, RECYCLE_AFTER - done) - len(running)
-                waiting = pending(store, set(running.values()) | skipped)
+                waiting = []
+                for folder in pending(store, set(running.values()) | skipped):
+                    if ready(folder):
+                        waiting.append(folder)
+                    else:
+                        skipped.add(ident(folder))
                 suspects = [folder for folder in waiting if _tried(folder)]
                 if suspects:
                     if not running:
@@ -458,7 +530,6 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
                     for folder in waiting[: max(room, 0)]:
                         running[pool.submit(_work, folder, converter)] = ident(folder)
             if not running:
-                skipped.clear()
                 time.sleep(timings.scan)
                 continue
             finished, _ = wait(running, timeout=timings.scan, return_when=FIRST_COMPLETED)
@@ -468,7 +539,7 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
                     alone = None
                 outcome = future.result()
                 if outcome is None:
-                    # A request that does not read waits for the next idle scan, not the next free worker.
+                    # A request that does not read waits for the next scan, not the next free worker.
                     skipped.add(name)
                     continue
                 done += 1

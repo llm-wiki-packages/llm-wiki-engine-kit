@@ -123,16 +123,27 @@ What the daemon does:
 
 1. **Find work.** Every 2 seconds, it lists each machine's segment of the
    store. It takes each request folder that holds `request.json` and no
-   `result.json`. A segment name is a machine id (`[a-z0-9][a-z0-9-]*`),
-   and a folder name is a 64-hex key. It skips every other name, such as a
-   sync tool's debris.
+   `result.json`. A segment name is a machine id: 1 to 64 characters of
+   `[a-z0-9-]`, starting with a letter or digit. A folder name is a 64-hex
+   key. It skips every other name, such as a sync tool's debris, and a
+   link at either level. It opens each level from its parent with
+   `O_NOFOLLOW`, so a segment swapped for a link after the scan is never
+   followed.
 2. **Read the request.** It reads `request.json` with `O_NOFOLLOW` and a
    64 KiB cap. It skips a folder whose request is a link, is not a regular
    file, or is off its shape. It never writes `body<suffix>` or
    `request.json`.
-3. **Wait for the body.** It converts only when the body's sha256 is the
+3. **Wait for the body.** It converts only when two scans in a row see
+   the body unchanged (inode, size and mtime), and its sha256 is the
    request's `sha256`. Until then, the request waits. The daemon does not
-   count an attempt and does not answer.
+   count an attempt and does not answer. A waiting folder costs one look
+   per scan.
+   - A body that is not a regular file (a link, a directory, a FIFO) is
+     answered `unreadable` at once.
+   - A body over 2 GiB, the host's own cap, is answered `too_large` and
+     never hashed.
+   - The hash reads the whole body. On a store that streams files on
+     demand, that read can block. Use Google Drive in mirror mode only.
 4. **Convert.** It calls the converter in one of `threads` workers.
 5. **Answer, result last.** It writes `output.md` for a converted file,
    then `result.json`. It writes each under a `.tmp-` name first, then
@@ -142,7 +153,8 @@ What the daemon does:
    lands it only when every listed file is present and matches.
 
 The daemon writes only `output.md`, `result.json` and its own `.tmp-`
-names. It never reads or removes any other name in a request folder.
+names. It never reads or removes any other name in a request folder. The
+`.tmp-` names can sync to the host; the host never reads them.
 
 How it handles failures:
 

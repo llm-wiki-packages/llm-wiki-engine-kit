@@ -356,21 +356,112 @@ def test_debris_inside_a_request_folder_is_left_alone(tmp_path):
     assert all((folder / name).read_text() == '{"reason": "timeout"}' for name in debris)
 
 
+def aged(path: Path, seconds: float = 100) -> None:
+    """Set `path`'s mtime `seconds` back, past the window where a digest is not cached."""
+    then = time.time() - seconds
+    os.utime(path, (then, then))
+
+
 @pytest.mark.parametrize("arrived", [None, "hel", "hellO"])
-def test_a_body_that_has_not_fully_arrived_waits_and_is_neither_tried_nor_answered(tmp_path, arrived):
+def test_a_body_that_has_not_fully_arrived_is_not_ready_until_it_matches_and_holds_still(tmp_path, arrived):
     folder = a_folder(tmp_path / "store", "k")
     (folder / "body.txt").unlink()
     if arrived is not None:
         (folder / "body.txt").write_text(arrived, encoding="utf-8")
-    called = []
-    assert kit._work(folder, lambda body, out, request: called.append(body)) is None
-    assert called == [] and sorted(p.name for p in folder.iterdir()) == sorted(
-        ["request.json", *([] if arrived is None else ["body.txt"])]
-    )
+    assert kit.ready(folder) is False and kit.ready(folder) is False
+    assert sorted(p.name for p in folder.iterdir()) == sorted(["request.json", *([] if arrived is None else ["body.txt"])])
     (folder / "body.txt").unlink(missing_ok=True)
     (folder / "body.txt").write_text("hello", encoding="utf-8")
+    assert kit.ready(folder) is False, "a body seen once may still be growing"
+    assert kit.ready(folder) is True
     assert kit._work(folder, lambda body, out, request: out.write_text("# ok\n") and None) is False
     assert result_of(folder) == converted("# ok\n")
+
+
+def test_a_body_grown_in_place_is_hashed_again_once_it_holds_still(tmp_path):
+    folder = a_folder(tmp_path / "store", "k")
+    body = folder / "body.txt"
+    body.write_text("he", encoding="utf-8")
+    aged(body)
+    before = body.stat()
+    assert kit.ready(folder) is False and kit.ready(folder) is False
+    with open(body, "a", encoding="utf-8") as held:
+        held.write("llo")
+    os.utime(body, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert body.stat().st_ino == before.st_ino
+    assert kit.ready(folder) is False
+    assert kit.ready(folder) is True
+
+
+def test_a_body_rewritten_in_place_at_one_size_is_hashed_again_once_it_holds_still(tmp_path):
+    folder = a_folder(tmp_path / "store", "k")
+    body = folder / "body.txt"
+    body.write_text("hellO", encoding="utf-8")
+    aged(body, 200)
+    assert kit.ready(folder) is False and kit.ready(folder) is False
+    with open(body, "r+", encoding="utf-8") as held:
+        held.write("hello")
+    aged(body, 100)
+    assert kit.ready(folder) is False
+    assert kit.ready(folder) is True
+
+
+def test_a_body_still_changing_is_never_hashed(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k")
+    body = folder / "body.txt"
+    hashed = []
+    real = kit.hashlib.sha256
+    monkeypatch.setattr(kit.hashlib, "sha256", lambda *a: hashed.append(1) or real(*a))
+    for size in range(1, 6):
+        body.write_text("hello"[:size], encoding="utf-8")
+        assert kit.ready(folder) is False
+    assert hashed == []
+
+
+@pytest.mark.parametrize("kind", ["link", "dir", "fifo"])
+def test_a_body_that_is_not_a_regular_file_is_answered_unreadable_at_once(tmp_path, kind):
+    folder = a_folder(tmp_path / "store", "k")
+    body = folder / "body.txt"
+    body.unlink()
+    if kind == "link":
+        (tmp_path / "elsewhere").write_text("hello")
+        body.symlink_to(tmp_path / "elsewhere")
+    elif kind == "dir":
+        body.mkdir()
+    else:
+        os.mkfifo(body)
+    assert kit.ready(folder) is True
+    assert kit._work(folder, lambda body, out, request: pytest.fail("converted")) is False
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+
+
+def test_a_body_past_the_hosts_cap_is_answered_too_large_without_a_hash(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k")
+    monkeypatch.setattr(kit, "MAX_BODY_BYTES", 3)
+    monkeypatch.setattr(kit.hashlib, "sha256", lambda *a: pytest.fail("hashed"))
+    assert kit.ready(folder) is True
+    assert kit._work(folder, lambda body, out, request: pytest.fail("converted")) is False
+    assert result_of(folder) == {"reason": "too_large", "traits": []}
+
+
+def test_a_link_at_the_machine_or_the_key_level_is_never_served(tmp_path):
+    store = tmp_path / "store"
+    mine = a_folder(store, "a")
+    elsewhere = a_folder(tmp_path / "elsewhere", "b")
+    (store / "box-c").symlink_to(elsewhere.parent)
+    (store / MACHINE / key_of("c")).symlink_to(elsewhere)
+    assert kit.pending(store, set()) == [mine]
+
+
+def test_a_segment_swapped_for_a_link_after_the_scan_is_never_followed(tmp_path):
+    store = tmp_path / "store"
+    folder = a_folder(store, "a")
+    assert kit.pending(store, set()) == [folder]
+    (store / MACHINE).rename(store / "real")
+    (store / MACHINE).symlink_to(store / "real")
+    assert kit.read_request(folder) is None
+    assert kit._work(folder, lambda body, out, request: out.write_text("# x\n") and None) is None
+    assert not (store / "real" / folder.name / "result.json").exists()
 
 
 def test_a_request_with_no_body_sha256_does_not_read(tmp_path):
@@ -439,6 +530,40 @@ def test_after_fifty_files_the_inner_process_exits_and_a_new_one_answers_the_nex
     pids = collections.Counter(f.joinpath("output.md").read_text(encoding="utf-8").split()[-1] for f in folders)
     assert sorted(pids.values()) == [1, kit.RECYCLE_AFTER]
     assert folders[-1].joinpath("output.md").read_text(encoding="utf-8").split()[-1] != str(proc.pid)
+
+
+def _tree_cpu_seconds(root: int) -> float:
+    """The user and system CPU time of `root` and every live descendant, from `/proc`: the inner process runs in a
+    session of its own, so a process group would miss it."""
+    stats = {}
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            try:
+                stats[int(entry)] = Path(f"/proc/{entry}/stat").read_text().rsplit(")", 1)[1].split()
+            except OSError:
+                continue
+    tree, grew = {root}, True
+    while grew:
+        found = {pid for pid, fields in stats.items() if int(fields[1]) in tree} - tree
+        tree |= found
+        grew = bool(found)
+    ticks = sum(int(stats[pid][11]) + int(stats[pid][12]) for pid in tree if pid in stats)
+    return ticks / os.sysconf("SC_CLK_TCK")
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads CPU time from /proc")
+def test_many_waiting_folders_cost_one_scan_per_pass_not_one_per_folder(tmp_path, daemon):
+    store = tmp_path / "store"
+    for n in range(300):
+        folder = a_folder(store, f"{n:03d}")
+        (folder / "body.txt").write_text("not yet", encoding="utf-8")
+    proc = daemon("echo", "--scan-seconds", "0.5")
+    time.sleep(1.5)
+    start = _tree_cpu_seconds(proc.pid)
+    time.sleep(3)
+    used = _tree_cpu_seconds(proc.pid) - start
+    assert proc.poll() is None
+    assert used < 1.0, f"{used:.2f}s of CPU in 3s idle with 300 waiting folders"
 
 
 def test_a_body_still_syncing_is_answered_once_it_arrives_whole(tmp_path, daemon):
