@@ -517,6 +517,21 @@ def test_an_inner_process_deaf_to_sigterm_is_killed_once_the_stop_runs_long(tmp_
     assert time.monotonic() - started >= ESCALATE * 0.8
 
 
+def test_an_inner_process_sees_its_own_outer_gone_after_a_new_outer_takes_the_scratch(tmp_path):
+    scratch = tmp_path / "scratch"
+    kit._wipe(scratch)
+    first = kit._hold(scratch / kit.KIT_DIR)
+    handle = kit._outer_handle(scratch / kit.KIT_DIR)
+    assert not kit._outer_gone(handle)
+    os.close(first)
+    kit._wipe(scratch)
+    second = kit._hold(scratch / kit.KIT_DIR)
+    try:
+        assert kit._outer_gone(handle)
+    finally:
+        os.close(second)
+
+
 def test_when_the_outer_process_is_killed_the_converters_own_child_goes_too(tmp_path, daemon):
     folder = a_folder(tmp_path / "store", "k")
     record = tmp_path / "child-pid"
