@@ -187,8 +187,9 @@ class _Memo(OrderedDict):
 
 
 class HashBudget:
-    """How many bodies one pass of the main loop may hash: a hash runs on the main thread, so a pass full of new large
-    bodies would delay the check that the outer process is still there."""
+    """How many bodies one pass of the main loop may hash: as many as it has free workers, so a backlog keeps every
+    worker busy, and no more, since a hash runs on the main thread and delays the check that the outer process is
+    still there."""
 
     def __init__(self, hashes: int):
         self.left = hashes
@@ -524,7 +525,7 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
 
     A folder an earlier inner process already tried runs alone, so a crash charges its attempt to that folder only.
     A folder whose request did not read is passed over until the next scan. A folder not `ready` is never submitted,
-    and costs a stat per pass: a pass hashes at most one body, and a body is hashed once per sight.
+    and costs a stat per pass: a pass hashes at most one body per free worker, and a body is hashed once per sight.
     """
     parent = os.getppid()
     kit = scratch / KIT_DIR
@@ -552,7 +553,7 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
                     skipped.clear()
                     cleared = time.monotonic()
                 room = min(threads, RECYCLE_AFTER - done) - len(running)
-                budget = HashBudget(1)
+                budget = HashBudget(max(1, room))
                 waiting = [folder for folder in pending(store, set(running.values()) | skipped) if ready(folder, budget)]
                 suspects = [folder for folder in waiting if _tried(folder)]
                 if suspects:

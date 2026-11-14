@@ -139,9 +139,9 @@ What the daemon does:
    then, the request waits. The daemon does not count an attempt and does
    not answer. It uses the ctime, because the local kernel sets it; a sync
    tool keeps the submitter's mtime, which can be in the future. It hashes
-   a body once per change, and at most one body per pass of its loop. The
-   hash runs on the loop's own thread, so a new large body delays the next
-   pass by its hash time.
+   a body once per change, and per pass of its loop at most one body per
+   free worker. The hash runs on the loop's own thread, so new large
+   bodies delay the next pass by their hash time.
    - A body that is not a regular file (a link, a directory, a FIFO) is
      answered `unreadable` at once.
    - A body over 2 GiB, the host's own cap, is answered `too_large` and

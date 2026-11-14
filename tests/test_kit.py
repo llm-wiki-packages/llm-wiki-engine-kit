@@ -621,6 +621,19 @@ def test_many_waiting_folders_cost_one_scan_per_pass_not_one_per_folder(tmp_path
     assert used < 1.0, f"{used:.2f}s of CPU in 3s idle with 300 waiting folders"
 
 
+def test_a_backlog_of_new_bodies_keeps_every_worker_busy(tmp_path, daemon):
+    store = tmp_path / "store"
+    folders = [a_folder(store, f"{n:03d}", options={"slow": 0.5}) for n in range(20)]
+    started = time.monotonic()
+    proc = daemon("crash", "--threads", "4", "--scan-seconds", "0.5")
+    for folder in folders:
+        wait_for(folder / "result.json", proc)
+    took = time.monotonic() - started
+    # Four workers fed in step take 5 rounds of 0.5 s plus a scan or two (about 3.2 s); one hash per pass feeds them
+    # about one body per scan (about 6.3 s).
+    assert took < 5.0, f"20 short converts on 4 workers took {took:.1f}s"
+
+
 def test_a_body_still_syncing_is_answered_once_it_arrives_whole(tmp_path, daemon):
     folder = a_folder(tmp_path / "store", "k", text="hello")
     (folder / "body.txt").write_text("hel", encoding="utf-8")
