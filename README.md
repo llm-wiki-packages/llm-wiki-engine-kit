@@ -134,10 +134,14 @@ What the daemon does:
    file, or is off its shape. It never writes `body<suffix>` or
    `request.json`.
 3. **Wait for the body.** It converts only when two scans in a row see
-   the body unchanged (inode, size and mtime), and its sha256 is the
-   request's `sha256`. Until then, the request waits. The daemon does not
-   count an attempt and does not answer. A waiting folder costs one look
-   per scan.
+   the body unchanged (inode, size, mtime and ctime), its ctime is at
+   least 2 seconds old, and its sha256 is the request's `sha256`. Until
+   then, the request waits. The daemon does not count an attempt and does
+   not answer. It uses the ctime, because the local kernel sets it; a sync
+   tool keeps the submitter's mtime, which can be in the future. It hashes
+   a body once per change, and at most one body per pass of its loop. The
+   hash runs on the loop's own thread, so a new large body delays the next
+   pass by its hash time.
    - A body that is not a regular file (a link, a directory, a FIFO) is
      answered `unreadable` at once.
    - A body over 2 GiB, the host's own cap, is answered `too_large` and

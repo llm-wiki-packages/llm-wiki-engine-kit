@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
@@ -72,7 +73,8 @@ _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 # The largest body a host copies into the store; a larger one is answered `too_large`, never hashed or converted.
 MAX_BODY_BYTES = 2 * 1024 * 1024 * 1024
 TOO_LARGE = {"reason": "too_large", "traits": []}
-# A digest of a body whose mtime is this recent is not cached: a write in the same mtime tick would not show.
+# A body whose ctime is this recent is not hashed yet: a write in the same tick would not show in its stat. The ctime,
+# not the mtime: the local kernel sets it, and a sync tool keeps the submitter's mtime, which may be in the future.
 RACY_SECONDS = 2.0
 _READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _WRITE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -90,6 +92,7 @@ class Timings:
     backoff: float = BACKOFF_SECONDS
     backoff_ceiling: float = BACKOFF_CEILING
     stop_escalate: float = STOP_ESCALATE_SECONDS
+    racy: float = RACY_SECONDS
 
 
 # The inner process's running converts, `name -> (folder, attempts before this one)`, so a stop can take its counts
@@ -162,23 +165,55 @@ def ident(folder: Path) -> str:
     return f"{folder.parent.name}.{folder.name}"
 
 
-# A body is seen as `(device, inode, size, mtime_ns)`. The last sight per folder, so a body is hashed only once two
-# scans in a row see it alike; and each digest by its sight, so a body that holds still is hashed once.
-_SEEN: dict[str, tuple[int, int, int, int]] = {}
-_HASHED: dict[tuple[int, int, int, int], str] = {}
-_MEMO_CAP = 4096
+class _Memo(OrderedDict):
+    """A dict that holds at most `cap` entries, evicting the least recently used: a store with more waiting folders
+    than the cap still keeps the folders it looked at last."""
+
+    def __init__(self, cap: int = 65536):
+        super().__init__()
+        self.cap = cap
+
+    def get(self, key, default=None):
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        return default
+
+    def __setitem__(self, key, value) -> None:
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > self.cap:
+            self.popitem(last=False)
 
 
-def _remember(memo: dict, key, value) -> None:
-    if len(memo) >= _MEMO_CAP:
-        memo.clear()
-    memo[key] = value
+class HashBudget:
+    """How many bodies one pass of the main loop may hash: a hash runs on the main thread, so a pass full of new large
+    bodies would delay the check that the outer process is still there."""
+
+    def __init__(self, hashes: int):
+        self.left = hashes
+
+    def take(self) -> bool:
+        if self.left <= 0:
+            return False
+        self.left -= 1
+        return True
 
 
-def ready(folder: Path) -> bool:
+# A body is seen as `(device, inode, size, mtime_ns, ctime_ns)`. The last sight per folder, so a body is hashed only
+# once two scans in a row see it alike; and each digest by its sight, so a body that holds still is hashed once, a
+# ready folder that waits for a free worker included.
+_SEEN: _Memo = _Memo()
+_HASHED: _Memo = _Memo()
+_RACY = [RACY_SECONDS]
+_clock = time.time
+
+
+def ready(folder: Path, budget: HashBudget | None = None) -> bool:
     """Whether the folder's request is one to answer now. A sync tool carries the body and `request.json` in any order,
-    and a body half written, so a regular body is ready only once two scans in a row see it alike and its sha256 is
-    the request's; until then the request waits, never tried nor answered. A body that is not a regular file, or past
+    and a body half written, so a regular body is ready only once two scans in a row see it alike, its ctime is
+    `RACY_SECONDS` old, and its sha256 is the request's; until then the request waits, never tried nor answered. A
+    hash takes one from `budget`, and none left reads as not ready yet. A body that is not a regular file, or past
     `MAX_BODY_BYTES`, is ready at once: its answer is `unreadable` or `too_large`."""
     request = read_request(folder)
     if request is None:
@@ -194,11 +229,15 @@ def ready(folder: Path) -> bool:
             return False
         if not stat.S_ISREG(held.st_mode) or held.st_size > MAX_BODY_BYTES:
             return True
-        seen = (held.st_dev, held.st_ino, held.st_size, held.st_mtime_ns)
+        seen = (held.st_dev, held.st_ino, held.st_size, held.st_mtime_ns, held.st_ctime_ns)
         if _SEEN.get(ident(folder)) != seen:
-            _remember(_SEEN, ident(folder), seen)
+            _SEEN[ident(folder)] = seen
             return False
-        digest = _HASHED.get(seen) or _hash(fd, request["body"], seen)
+        digest = _HASHED.get(seen)
+        if digest is None:
+            if _clock() - held.st_ctime_ns / 1e9 < _RACY[0] or (budget is not None and not budget.take()):
+                return False
+            digest = _hash(fd, request["body"], seen)
         return digest == request["sha256"]
     except OSError:
         return False
@@ -206,13 +245,12 @@ def ready(folder: Path) -> bool:
         os.close(fd)
 
 
-def _hash(fd: int, name: str, seen: tuple[int, int, int, int]) -> str | None:
-    """The body's sha256 where it is still the file `seen` describes; cached only where its mtime is more than
-    `RACY_SECONDS` old, since a write inside one mtime tick leaves `seen` alike."""
+def _hash(fd: int, name: str, seen: tuple[int, int, int, int, int]) -> str | None:
+    """The body's sha256, cached by its sight, where it is still the file `seen` describes."""
     body = os.open(name, _READ, dir_fd=fd)
     try:
         held = os.fstat(body)
-        if (held.st_dev, held.st_ino, held.st_size, held.st_mtime_ns) != seen:
+        if (held.st_dev, held.st_ino, held.st_size, held.st_mtime_ns, held.st_ctime_ns) != seen:
             return None
         digest = hashlib.sha256()
         while chunk := os.read(body, _CHUNK):
@@ -220,8 +258,7 @@ def _hash(fd: int, name: str, seen: tuple[int, int, int, int]) -> str | None:
     finally:
         os.close(body)
     found = digest.hexdigest()
-    if time.time() - seen[3] / 1e9 > RACY_SECONDS:
-        _remember(_HASHED, seen, found)
+    _HASHED[seen] = found
     return found
 
 
@@ -486,8 +523,8 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
     """Answer requests until a converter raises, `RECYCLE_AFTER` files are done, or the outer process is gone.
 
     A folder an earlier inner process already tried runs alone, so a crash charges its attempt to that folder only.
-    A folder not `ready`, or whose request did not read, is passed over until the next scan, so a store full of
-    requests still syncing costs one scan per `timings.scan`, not one per folder.
+    A folder whose request did not read is passed over until the next scan. A folder not `ready` is never submitted,
+    and costs a stat per pass: a pass hashes at most one body, and a body is hashed once per sight.
     """
     parent = os.getppid()
     kit = scratch / KIT_DIR
@@ -515,12 +552,8 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
                     skipped.clear()
                     cleared = time.monotonic()
                 room = min(threads, RECYCLE_AFTER - done) - len(running)
-                waiting = []
-                for folder in pending(store, set(running.values()) | skipped):
-                    if ready(folder):
-                        waiting.append(folder)
-                    else:
-                        skipped.add(ident(folder))
+                budget = HashBudget(1)
+                waiting = [folder for folder in pending(store, set(running.values()) | skipped) if ready(folder, budget)]
                 suspects = [folder for folder in waiting if _tried(folder)]
                 if suspects:
                     if not running:
@@ -788,6 +821,7 @@ def serve(
     if os.environ.pop(INNER_ENV, "") == "1":
         _apply_env(scratch, env or {})
         _DEFAULT_TIMEOUT[0] = float(timeout_seconds)
+        _RACY[0] = timings.racy
         return _inner(engine, factory, max(1, threads), store, scratch, timings)
     store.mkdir(parents=True, exist_ok=True)
     root = _import_root(factory)

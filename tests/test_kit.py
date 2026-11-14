@@ -22,7 +22,15 @@ WAIT = 60
 # Sub-second waits, so a daemon test costs its own work and not the service's patience.
 ESCALATE = 0.5
 FAST = ["--scan-seconds", "0.05", "--poll-seconds", "0.05", "--backoff-seconds", "0.05"]
-FAST += ["--backoff-ceiling-seconds", "0.2", "--stop-escalate-seconds", str(ESCALATE)]
+FAST += ["--backoff-ceiling-seconds", "0.2", "--stop-escalate-seconds", str(ESCALATE), "--racy-seconds", "0"]
+
+
+@pytest.fixture(autouse=True)
+def settled(monkeypatch):
+    """Every body's last change counts as long past, unless a test sets the clock back; each test starts unseen."""
+    monkeypatch.setattr(kit, "_clock", lambda: time.time() + 10)
+    kit._SEEN.clear()
+    kit._HASHED.clear()
 
 
 MACHINE = "box-a"
@@ -404,6 +412,53 @@ def test_a_body_rewritten_in_place_at_one_size_is_hashed_again_once_it_holds_sti
     aged(body, 100)
     assert kit.ready(folder) is False
     assert kit.ready(folder) is True
+
+
+def counted_hashes(monkeypatch) -> list:
+    hashed = []
+    real = kit.hashlib.sha256
+    monkeypatch.setattr(kit.hashlib, "sha256", lambda *a: hashed.append(1) or real(*a))
+    return hashed
+
+
+def test_a_body_with_a_future_mtime_that_holds_still_is_hashed_once(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k")
+    future = time.time() + 86400
+    os.utime(folder / "body.txt", (future, future))
+    hashed = counted_hashes(monkeypatch)
+    assert kit.ready(folder) is False
+    for _ in range(5):
+        assert kit.ready(folder) is True
+    assert hashed == [1]
+
+
+def test_a_body_changed_under_two_seconds_ago_is_not_hashed_yet(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k")
+    monkeypatch.setattr(kit, "_clock", time.time)
+    hashed = counted_hashes(monkeypatch)
+    assert kit.ready(folder) is False and kit.ready(folder) is False
+    assert hashed == []
+    monkeypatch.setattr(kit, "_clock", lambda: time.time() + kit.RACY_SECONDS + 1)
+    assert kit.ready(folder) is True and hashed == [1]
+
+
+def test_hashing_is_bounded_per_pass(tmp_path, monkeypatch):
+    store = tmp_path / "store"
+    first, second = a_folder(store, "a"), a_folder(store, "b")
+    hashed = counted_hashes(monkeypatch)
+    assert kit.ready(first) is False and kit.ready(second) is False
+    budget = kit.HashBudget(1)
+    assert (kit.ready(first, budget), kit.ready(second, budget)) == (True, False)
+    assert hashed == [1]
+    assert kit.ready(second, kit.HashBudget(1)) is True
+
+
+def test_a_full_memo_evicts_its_least_recently_used_entry():
+    memo = kit._Memo(cap=2)
+    memo["a"], memo["b"] = 1, 2
+    assert memo.get("a") == 1
+    memo["c"] = 3
+    assert sorted(memo) == ["a", "c"]
 
 
 def test_a_body_still_changing_is_never_hashed(tmp_path, monkeypatch):
