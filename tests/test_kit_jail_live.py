@@ -1,5 +1,6 @@
 """The kit's own jail: a converter inside it cannot write outside its grants, reach the network or read the home."""
 
+import contextlib
 import hashlib
 import json
 import os
@@ -117,3 +118,46 @@ def test_jailed_a_module_the_converter_plants_never_runs_in_the_next_inner_proce
     assert json.loads((first / "result.json").read_text(encoding="utf-8"))["reason"] == "unreadable"
     assert not marker.exists()
     assert (second / "output.md").read_text(encoding="utf-8") == "# clean\n"
+
+
+def test_jailed_an_inner_process_whose_outer_was_killed_ends_when_a_new_outer_takes_the_scratch(live):
+    store = live / "store"
+    store.mkdir()
+    record = store / ".pids"
+    argv = [sys.executable, "-m", "llm_wiki_engine_kit", "serve", "--store", str(store), "--cache", str(live / "cache")]
+    # A scan slower than the new outer's start, as the default is: the new lock is in place at the orphan's next look.
+    argv += ["--factory", "kitstubs:echo", "--read", str(TESTS), "--scan-seconds", "3", "--poll-seconds", "0.05"]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(KIT), str(TESTS)]), "KIT_STUB_RECORD": str(record)}
+    # No pipes: an orphan would hold them open, and reading them would wait on it.
+    quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "start_new_session": True}
+    first = subprocess.Popen(argv, env=env, **quiet)
+    second, orphan = None, None
+    try:
+        deadline = time.monotonic() + WAIT
+        while not record.exists() or not record.read_text(encoding="utf-8").strip():
+            assert first.poll() is None, f"the daemon exited {first.returncode}"
+            assert time.monotonic() < deadline, "the first inner process built no converter"
+            time.sleep(0.05)
+        orphan = int(record.read_text(encoding="utf-8").split()[0])
+        # The outer alone, as a service manager's kill of its main process: the jail's runtime stays the parent.
+        os.kill(first.pid, signal.SIGKILL)
+        first.wait(WAIT)
+        second = subprocess.Popen(argv, env=env, **quiet)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                os.kill(orphan, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the killed outer's inner process still runs beside the new outer's")
+    finally:
+        for proc in (first, second):
+            if proc is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(WAIT)
+        if orphan is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(orphan), signal.SIGKILL)

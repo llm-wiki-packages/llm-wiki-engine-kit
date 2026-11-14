@@ -504,19 +504,24 @@ def _tried(folder: Path) -> int:
         os.close(fd)
 
 
-def _outer_gone(kit: Path) -> bool:
-    """True once the outer process no longer holds its lock. Its parent is the jail's runtime, which outlives it, and
-    a killed outer process its own parent has not reaped still answers a signal 0."""
+def _outer_handle(kit: Path) -> int | None:
+    """The lock file of the outer process that started this inner one, opened once. A new outer process wipes the
+    scratch and locks a new file at the same path, so a lookup by path would read the new outer as this one's."""
     try:
-        fd = os.open(kit / OUTER_LOCK, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        return os.open(kit / OUTER_LOCK, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
+        return None
+
+
+def _outer_gone(handle: int | None) -> bool:
+    """True once this inner process's own outer process no longer holds its lock. Its parent is the jail's runtime,
+    which outlives it, and a killed outer process its own parent has not reaped still answers a signal 0."""
+    if handle is None:
         return True
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         return False
-    finally:
-        os.close(fd)
     return True
 
 
@@ -531,6 +536,7 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
     kit = scratch / KIT_DIR
     kit.mkdir(exist_ok=True)
     _KIT[:] = [kit]
+    outer = _outer_handle(kit)
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     converter = factory({"engine": engine, "store": store, "scratch": scratch, "threads": threads})
@@ -541,7 +547,7 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
     cleared = time.monotonic()
     with ThreadPoolExecutor(max_workers=threads) as pool:
         while True:
-            if os.getppid() != parent or _outer_gone(kit):
+            if os.getppid() != parent or _outer_gone(outer):
                 # The whole group, not a return: leaving the pool waits for a convert that may never end, and a
                 # converter's own children would outlive an exit.
                 os.killpg(os.getpgrp(), signal.SIGKILL)
