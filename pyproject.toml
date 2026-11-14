@@ -1,6 +1,6 @@
 [project]
 name = "llm-wiki-engine-kit"
-version = "0.1.1"
+version = "0.2.0"
 description = "Turns a convert function into a jailed daemon that serves the LLM-wiki engine request store"
 requires-python = ">=3.14"
 # Standard library only. An engine tool depends on the kit by a git URL
