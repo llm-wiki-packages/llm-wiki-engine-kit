@@ -610,11 +610,13 @@ def test_a_narrate_answer_with_no_transcript_lists_the_mp3_alone(tmp_path):
         (None, VTT_TEXT.encode()),
         (b"RIFF....WAVE", None),
         (b"", None),
+        (b"\xff\x00\x00\x00", None),
+        (b"\xff\xc0\x00\x00", None),
         (MP3_BYTES, b"NOTVTT\n"),
         (MP3_BYTES, b"WEBVTT\n\xff\xfe"),
         (MP3_BYTES, b""),
     ],
-    ids=["no-mp3", "wav-not-mp3", "empty-mp3", "vtt-no-header", "vtt-not-utf8", "empty-vtt"],
+    ids=["no-mp3", "wav-not-mp3", "empty-mp3", "ff00-no-sync", "ffc0-no-sync", "vtt-no-header", "vtt-not-utf8", "empty-vtt"],
 )
 def test_an_output_the_host_would_refuse_answers_unreadable_and_publishes_nothing(tmp_path, mp3, vtt):
     folder = a_folder(tmp_path / "store", "k", section="narrate")
@@ -630,12 +632,105 @@ def test_a_vtt_that_opens_with_a_byte_order_mark_is_published(tmp_path):
     assert result_of(folder)["outputs"] == listed(output_mp3=MP3_BYTES, output_vtt=vtt)
 
 
-def test_an_mp3_past_the_hosts_cap_answers_too_large(tmp_path, monkeypatch):
+def test_an_mp3_past_the_hosts_cap_answers_too_large_without_a_hash(tmp_path, monkeypatch):
     monkeypatch.setitem(kit.OUTPUT_CAPS, "output.mp3", len(MP3_BYTES) - 1)
     folder = a_folder(tmp_path / "store", "k", section="narrate")
-    narrated(folder, speaker())
+    request = kit.read_request(folder)
+    hashes = []
+    real = hashlib.sha256
+    monkeypatch.setattr(kit.hashlib, "sha256", lambda *a: hashes.append(a) or real(*a))
+    kit.answer(folder, request, speaker(), sections=("narrate",))
+    assert hashes == []
     assert result_of(folder) == {"reason": "too_large", "traits": []}
     assert not (folder / "output.mp3").exists() and not (folder / "output.vtt").exists()
+
+
+def test_an_output_changed_while_it_is_read_answers_unreadable(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    real, grown = os.read, []
+
+    def convert(body, out, request):
+        speaker()(body, out, request)
+        os.utime(out / "output.mp3", (time.time() - 1000, time.time() - 1000))
+
+    def read(fd, n):
+        data = real(fd, n)
+        if not grown and data and os.readlink(f"/proc/self/fd/{fd}").endswith("output.mp3"):
+            grown.append(fd)
+            with open(folder / ".tmp-out" / "output.mp3", "ab") as more:
+                more.write(b"late")
+        return data
+
+    monkeypatch.setattr(os, "read", read)
+    narrated(folder, convert)
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+    assert not (folder / "output.mp3").exists()
+
+
+def locked_dir(where: Path) -> None:
+    """A folder holding a file, left without write permission, as a converter might."""
+    where.mkdir()
+    (where / "inside").write_bytes(b"x")
+    where.chmod(0o500)
+
+
+def test_a_read_only_folder_the_converter_leaves_is_cleared_and_the_answer_lands(tmp_path):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+
+    def convert(body, out, request):
+        speaker()(body, out, request)
+        locked_dir(out / "cache")
+        out.chmod(0o500)
+
+    narrated(folder, convert)
+    assert result_of(folder)["reason"] is None
+    assert not (folder / ".tmp-out").exists()
+
+
+def test_an_output_md_turned_into_a_read_only_folder_is_cleared_and_answers_unreadable(tmp_path):
+    folder = a_folder(tmp_path / "store", "k")
+
+    def convert(body, out, request):
+        locked_dir(out)
+
+    kit.answer(folder, kit.read_request(folder), convert)
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+    assert not (folder / ".tmp-output.md").exists()
+
+
+def test_a_leftover_that_will_not_clear_answers_unreadable_without_a_convert(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    (folder / ".tmp-out").mkdir()
+
+    def stuck(*args, **kwargs):
+        raise PermissionError("stuck")
+
+    monkeypatch.setattr(kit.shutil, "rmtree", stuck)
+    calls = []
+    assert narrated(folder, lambda body, out, request: calls.append(out)) is False
+    assert calls == []
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+
+
+def test_a_leftover_that_will_not_clear_after_the_convert_still_answers(tmp_path, monkeypatch):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+
+    def convert(body, out, request):
+        speaker()(body, out, request)
+        monkeypatch.setattr(kit.shutil, "rmtree", lambda *a, **k: (_ for _ in ()).throw(PermissionError("stuck")))
+
+    narrated(folder, convert)
+    assert result_of(folder)["reason"] is None
+    assert (folder / "output.mp3").read_bytes() == MP3_BYTES
+
+
+def test_published_outputs_a_dead_daemon_left_are_cleared_before_a_reason_answer(tmp_path):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+    (folder / "output.mp3").write_bytes(b"ID3 stale")
+    (folder / "output.vtt").write_text("WEBVTT stale")
+    narrated(folder, lambda body, out, request: {"reason": "unreadable"})
+    assert result_of(folder) == {"reason": "unreadable", "traits": []}
+    assert sorted(p.name for p in folder.iterdir()) == ["body.txt", "request.json", "result.json"]
 
 
 def test_the_hosts_caps_are_the_kits():

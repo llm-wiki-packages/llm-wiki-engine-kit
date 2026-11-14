@@ -332,15 +332,54 @@ def _shape(answer) -> dict:
 
 
 def _clear(fd: int, name: str) -> None:
-    """`name` in the folder `fd` removed, a folder with all it holds; a link is unlinked, never followed."""
+    """`name` in the folder `fd` removed, a folder with all it holds; a link is unlinked, never followed. A folder the
+    converter left without write permission is given it back, never through a link, and removed again."""
     try:
         held = os.stat(name, dir_fd=fd, follow_symlinks=False)
     except FileNotFoundError:
         return
-    if stat.S_ISDIR(held.st_mode):
-        shutil.rmtree(name, dir_fd=fd)
-    else:
+    if not stat.S_ISDIR(held.st_mode):
         os.unlink(name, dir_fd=fd)
+        return
+    try:
+        shutil.rmtree(name, dir_fd=fd)
+    except OSError:
+        _writable(fd, name)
+        shutil.rmtree(name, dir_fd=fd)
+
+
+def _writable(fd: int, name: str) -> None:
+    """Every folder in the tree at `name` in the folder `fd` made the owner's to list and write; a link is never
+    followed, nor a file's mode touched."""
+    pending = [(os.dup(fd), name)]
+    while pending:
+        parent, one = pending.pop()
+        try:
+            if not stat.S_ISDIR(os.stat(one, dir_fd=parent, follow_symlinks=False).st_mode):
+                continue
+            os.chmod(one, 0o700, dir_fd=parent, follow_symlinks=False)
+            held = os.open(one, _DIR, dir_fd=parent)
+        except OSError:
+            continue
+        finally:
+            os.close(parent)
+        try:
+            for entry in os.listdir(held):
+                pending.append((os.dup(held), entry))
+        finally:
+            os.close(held)
+
+
+def _cleared(fd: int, names: Iterable[str]) -> bool:
+    """Whether every name in `names` is gone from the folder `fd` (`_clear`); a name that stays is said, not raised,
+    so a leftover that will not go answers rather than retrying until the host's deadline."""
+    for name in names:
+        try:
+            _clear(fd, name)
+        except OSError as exc:
+            _say(f"{name} did not clear: {exc}")
+            return False
+    return True
 
 
 def _mp3_head(head: bytes) -> bool:
@@ -395,6 +434,9 @@ def _publish_outputs(fd: int, section: str) -> dict:
         source = os.open(TMP_MEDIA, _DIR, dir_fd=fd) if media else os.dup(fd)
     except OSError:
         return UNREADABLE
+    if media:
+        # The converter may have taken write permission off its own folder; the renames out of it need it.
+        os.fchmod(source, 0o700)
     # Each checked file stays open until its published name is compared: an inode still open is never freed, so its
     # number cannot pass to a file swapped in after the check.
     opened: list[int] = []
@@ -454,11 +496,13 @@ def answer(folder: Path, request: dict, converter: Converter, *, sections: Itera
     section = request.get("section", "convert")
     fd = folder_fd(folder)
     try:
-        _clear(fd, TMP_OUTPUT)
-        _clear(fd, TMP_MEDIA)
+        # A dead daemon's leftovers, its published outputs included: a reason answer then stands alone.
+        clean = _cleared(fd, (TMP_OUTPUT, TMP_MEDIA, *SECTION_OUTPUTS.get(section, ())))
         failed = False
         tried = _attempts(fd)
-        if tried >= MAX_ATTEMPTS:
+        if not clean:
+            result = UNREADABLE
+        elif tried >= MAX_ATTEMPTS:
             _say(f"{ident(folder)}: {tried} attempts ended the process; answering unreadable")
             result = UNREADABLE
         elif section not in sections or section not in SECTION_OUTPUTS:
@@ -483,8 +527,8 @@ def answer(folder: Path, request: dict, converter: Converter, *, sections: Itera
                 _ended(folder)
         if result is None:
             result = _publish_outputs(fd, section)
-        _clear(fd, TMP_OUTPUT)
-        _clear(fd, TMP_MEDIA)
+        # A leftover that stays costs the folder some space, not its answer.
+        _cleared(fd, (TMP_OUTPUT, TMP_MEDIA))
         _write_new(fd, TMP_RESULT, (json.dumps(result) + "\n").encode("utf-8"))
         _publish(fd, TMP_RESULT, RESULT)
         try:

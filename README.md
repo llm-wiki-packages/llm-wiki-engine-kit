@@ -16,8 +16,8 @@ Depend on the commit sha of a release tag, by git URL, in the engine's
 
 ```toml
 dependencies = [
-    # llm-wiki-engine-kit v0.1.0
-    "llm-wiki-engine-kit @ git+https://github.com/llm-wiki-packages/llm-wiki-engine-kit@31e4c5a640f02d1ee826d8e54a20537c5ae9698c",
+    # llm-wiki-engine-kit v0.3.0
+    "llm-wiki-engine-kit @ git+https://github.com/llm-wiki-packages/llm-wiki-engine-kit@<commit of v0.3.0>",
 ]
 ```
 
@@ -224,6 +224,12 @@ How it handles failures:
 - **Timeout.** Each convert gets `timeout_seconds`. A request's options can
   name their own. Past it, the outer process kills the inner process, and
   that counts as an attempt.
+- **Leftovers.** Before a convert, the daemon removes a dead daemon's
+  `.tmp-` names and the section's output files. It gives back write
+  permission to a folder that a converter locked. A leftover that still
+  does not go answers `unreadable`, so the request does not wait until its
+  deadline. A leftover that stays after the convert does not change the
+  answer.
 - **Attempts.** The daemon keeps an attempt count in the folder under a
   `.tmp-` name. A folder whose convert ended the inner process twice is
   answered `unreadable` at the next start.
