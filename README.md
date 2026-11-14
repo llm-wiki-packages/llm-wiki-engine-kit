@@ -11,13 +11,19 @@ only.
 
 ## Use it in an engine
 
-Depend on a release tag by git URL in the engine's `pyproject.toml`:
+Depend on the commit sha of a release tag, by git URL, in the engine's
+`pyproject.toml`. Name the tag in a comment beside it:
 
 ```toml
 dependencies = [
-    "llm-wiki-engine-kit @ git+https://github.com/llm-wiki-packages/llm-wiki-engine-kit@v0.1.0",
+    # llm-wiki-engine-kit v0.1.0
+    "llm-wiki-engine-kit @ git+https://github.com/llm-wiki-packages/llm-wiki-engine-kit@31e4c5a640f02d1ee826d8e54a20537c5ae9698c",
 ]
 ```
+
+Pin the commit, not the tag. A tag can move, and a commit cannot.
+`uv tool install` reads no lock, so this line is the engine's only pin.
+`git rev-parse <tag>^{commit}` gives a tag's commit.
 
 The repo is public, so the install needs no GitHub credentials.
 

@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "Turns a convert function into a jailed daemon that serves the LLM-wiki engine request store"
 requires-python = ">=3.14"
 # Standard library only. An engine tool depends on the kit by a git URL
-# pinned to a release tag, so the kit installs into the engine's own venv.
+# pinned to the commit of a release tag, so the kit installs into the
+# engine's own venv.
 # It has no console script of its own.
 dependencies = []
 license = "MIT"
