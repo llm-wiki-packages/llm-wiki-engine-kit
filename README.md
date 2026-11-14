@@ -152,7 +152,7 @@ How it handles failures:
 ## Tests
 
 ```sh
-uv run pytest -q
+uv run --locked pytest -q
 ```
 
 The `sandbox` rows (`tests/test_kit_jail_live.py`) run the real jail. They
