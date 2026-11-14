@@ -77,7 +77,8 @@ def probed(root: Path, port: int, *, jailed: bool) -> list[str]:
             time.sleep(0.05)
     finally:
         if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
         proc.communicate()
     return (folder / "output.md").read_text(encoding="utf-8").splitlines()
 
@@ -113,7 +114,8 @@ def test_jailed_a_module_the_converter_plants_never_runs_in_the_next_inner_proce
             time.sleep(0.05)
     finally:
         if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
         proc.communicate()
     assert json.loads((first / "result.json").read_text(encoding="utf-8"))["reason"] == "unreadable"
     assert not marker.exists()
@@ -155,9 +157,9 @@ def test_jailed_an_inner_process_whose_outer_was_killed_ends_when_a_new_outer_ta
     finally:
         for proc in (first, second):
             if proc is not None:
-                with contextlib.suppress(ProcessLookupError):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait(WAIT)
         if orphan is not None:
-            with contextlib.suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(os.getpgid(orphan), signal.SIGKILL)
