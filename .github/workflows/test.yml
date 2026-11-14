@@ -35,4 +35,4 @@ jobs:
           sudo install -m 0755 "$(find "$RUNNER_TEMP/nono" -type f -name nono -perm -u+x | head -1)" /usr/local/bin/nono
           nono --version
       - name: Run the tests
-        run: uv run pytest -q
+        run: uv run --locked pytest -q
