@@ -395,6 +395,9 @@ def _publish_outputs(fd: int, section: str) -> dict:
         source = os.open(TMP_MEDIA, _DIR, dir_fd=fd) if media else os.dup(fd)
     except OSError:
         return UNREADABLE
+    # Each checked file stays open until its published name is compared: an inode still open is never freed, so its
+    # number cannot pass to a file swapped in after the check.
+    opened: list[int] = []
     try:
         found: list[tuple[str, str, tuple[str, int, tuple[int, int]]]] = []
         for name in names:
@@ -407,10 +410,8 @@ def _publish_outputs(fd: int, section: str) -> dict:
                 continue
             except OSError:
                 return UNREADABLE
-            try:
-                checked = _checked(held, name)
-            finally:
-                os.close(held)
+            opened.append(held)
+            checked = _checked(held, name)
             if isinstance(checked, dict):
                 return checked
             found.append((src, name, checked))
@@ -426,6 +427,8 @@ def _publish_outputs(fd: int, section: str) -> dict:
         outputs = {name: {"sha256": sha, "size": size} for _src, name, (sha, size, _identity) in found}
         return {"reason": None, "traits": [], "outputs": outputs}
     finally:
+        for held in opened:
+            os.close(held)
         os.close(source)
 
 
