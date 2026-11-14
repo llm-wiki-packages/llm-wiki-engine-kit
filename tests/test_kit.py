@@ -698,6 +698,32 @@ def test_an_output_md_turned_into_a_read_only_folder_is_cleared_and_answers_unre
     assert not (folder / ".tmp-output.md").exists()
 
 
+def test_a_locked_folder_of_many_files_clears_without_leaking_a_descriptor(tmp_path):
+    folder = a_folder(tmp_path / "store", "k", section="narrate")
+
+    def convert(body, out, request):
+        speaker()(body, out, request)
+        sub = out / "sub"
+        sub.mkdir()
+        for n in range(600):
+            (sub / f"f{n}").write_bytes(b"")
+        sub.chmod(0o500)
+
+    request = kit.read_request(folder)
+    resource = pytest.importorskip("resource")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    before = len(os.listdir("/proc/self/fd"))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (before + 200, hard))
+    try:
+        kit.answer(folder, request, convert, sections=("narrate",))
+        after = len(os.listdir("/proc/self/fd"))
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    assert after == before
+    assert result_of(folder)["reason"] is None
+    assert not (folder / ".tmp-out").exists()
+
+
 def test_a_leftover_that_will_not_clear_answers_unreadable_without_a_convert(tmp_path, monkeypatch):
     folder = a_folder(tmp_path / "store", "k", section="narrate")
     (folder / ".tmp-out").mkdir()

@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Iterator, Mapping
 
 REQUEST, RESULT, OUTPUT = "request.json", "result.json", "output.md"
 MP3, VTT = "output.mp3", "output.vtt"
@@ -350,24 +350,41 @@ def _clear(fd: int, name: str) -> None:
 
 def _writable(fd: int, name: str) -> None:
     """Every folder in the tree at `name` in the folder `fd` made the owner's to list and write; a link is never
-    followed, nor a file's mode touched."""
-    pending = [(os.dup(fd), name)]
-    while pending:
-        parent, one = pending.pop()
-        try:
-            if not stat.S_ISDIR(os.stat(one, dir_fd=parent, follow_symlinks=False).st_mode):
+    followed, nor a file's mode touched. Depth first, holding a descriptor only for each folder on the current path."""
+    path: list[tuple[int, Iterator[str]]] = []
+    try:
+        opened = _unlocked(fd, name)
+        if opened is not None:
+            path.append(opened)
+        while path:
+            parent, names = path[-1]
+            child = next(names, None)
+            if child is None:
+                os.close(path.pop()[0])
                 continue
-            os.chmod(one, 0o700, dir_fd=parent, follow_symlinks=False)
-            held = os.open(one, _DIR, dir_fd=parent)
-        except OSError:
-            continue
-        finally:
-            os.close(parent)
-        try:
-            for entry in os.listdir(held):
-                pending.append((os.dup(held), entry))
-        finally:
+            opened = _unlocked(parent, child)
+            if opened is not None:
+                path.append(opened)
+    finally:
+        for held, _names in path:
             os.close(held)
+
+
+def _unlocked(parent: int, name: str) -> tuple[int, Iterator[str]] | None:
+    """The folder `name` in `parent` made the owner's to list and write, opened, with its names; None where it is not
+    a folder or does not open."""
+    try:
+        if not stat.S_ISDIR(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
+            return None
+        os.chmod(name, 0o700, dir_fd=parent, follow_symlinks=False)
+        held = os.open(name, _DIR, dir_fd=parent)
+    except OSError:
+        return None
+    try:
+        return held, iter(os.listdir(held))
+    except OSError:
+        os.close(held)
+        return None
 
 
 def _cleared(fd: int, names: Iterable[str]) -> bool:
