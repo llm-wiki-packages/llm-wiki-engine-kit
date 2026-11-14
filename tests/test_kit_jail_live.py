@@ -1,5 +1,6 @@
 """The kit's own jail: a converter inside it cannot write outside its grants, reach the network or read the home."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -43,15 +44,22 @@ def listener():
     held.close()
 
 
+def request_folder(store: Path, name: str, options: dict) -> Path:
+    """A request at `<store>/<machine>/<key>/`, as a host submits it."""
+    folder = store / "box-a" / name.encode("utf-8").hex().ljust(64, "0")
+    folder.mkdir(parents=True)
+    (folder / "body.txt").write_text("hello", encoding="utf-8")
+    request = {"body": "body.txt", "sha256": hashlib.sha256(b"hello").hexdigest(), "options": options}
+    (folder / "request.json").write_text(json.dumps(request), encoding="utf-8")
+    return folder
+
+
 def probed(root: Path, port: int, *, jailed: bool) -> list[str]:
     store = root / "store"
-    folder = store / "k"
-    folder.mkdir(parents=True)
     canary = root / "canary.txt"
     canary.write_text("secret", encoding="utf-8")
-    (folder / "body.txt").write_text("hello", encoding="utf-8")
     options = {"outside": str(root / "outside.txt"), "port": port, "canary": str(canary)}
-    (folder / "request.json").write_text(json.dumps({"body": "body.txt", "options": options}), encoding="utf-8")
+    folder = request_folder(store, "k", options)
     argv = [sys.executable, "-m", "llm_wiki_engine_kit", "serve", "--store", str(store), "--cache", str(root / "cache")]
     argv += ["--factory", "kitstubs:probe", "--read", str(TESTS), "--scan-seconds", "0.05", "--poll-seconds", "0.05"]
     if not jailed:
@@ -88,18 +96,15 @@ def test_jailed_the_probe_reaches_none_of_them(live, listener):
 def test_jailed_a_module_the_converter_plants_never_runs_in_the_next_inner_process(live):
     store = live / "store"
     marker = store / "planted-ran"
-    for name, options in (("a", {"plant": True, "marker": str(marker)}), ("b", {})):
-        folder = store / name
-        folder.mkdir(parents=True)
-        (folder / "body.txt").write_text("hello", encoding="utf-8")
-        (folder / "request.json").write_text(json.dumps({"body": "body.txt", "options": options}), encoding="utf-8")
+    first = request_folder(store, "a", {"plant": True, "marker": str(marker)})
+    second = request_folder(store, "b", {})
     argv = [sys.executable, "-m", "llm_wiki_engine_kit", "serve", "--store", str(store), "--cache", str(live / "cache")]
     argv += ["--factory", "kitstubs:plant", "--read", str(TESTS), "--scan-seconds", "0.05", "--poll-seconds", "0.05"]
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(KIT), str(TESTS)])}
     proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     try:
         deadline = time.monotonic() + WAIT
-        while not (store / "b" / "result.json").exists():
+        while not (second / "result.json").exists():
             if proc.poll() is not None:
                 pytest.fail(f"the daemon exited {proc.returncode}: {proc.communicate()[1].decode()[-2000:]}")
             if time.monotonic() > deadline:
@@ -109,6 +114,6 @@ def test_jailed_a_module_the_converter_plants_never_runs_in_the_next_inner_proce
         if proc.poll() is None:
             os.killpg(proc.pid, signal.SIGKILL)
         proc.communicate()
-    assert json.loads((store / "a" / "result.json").read_text(encoding="utf-8"))["reason"] == "unreadable"
+    assert json.loads((first / "result.json").read_text(encoding="utf-8"))["reason"] == "unreadable"
     assert not marker.exists()
-    assert (store / "b" / "output.md").read_text(encoding="utf-8") == "# clean\n"
+    assert (second / "output.md").read_text(encoding="utf-8") == "# clean\n"

@@ -1,7 +1,7 @@
 # llm-wiki-engine-kit
 
 The engine kit turns a convert function into a jailed daemon. The daemon
-serves one engine's folder of the LLM-wiki engine request store. An async
+serves one engine's LLM-wiki engine request store. An async
 extract engine, such as
 [llm-wiki-engine-docling](https://github.com/llm-wiki-packages/llm-wiki-engine-docling),
 is a convert function plus this kit.
@@ -78,7 +78,7 @@ The jail grants:
   kit, the directory the engine's own package imports from, and the
   engine's `reads`. The engine's import directory is never the home or a
   directory above it.
-- write: the engine's folder of the request store, and one scratch
+- write: the engine's request store (`--store`), and one scratch
   directory, `<cache>/tmp/`. The outer process wipes the scratch before
   each start.
 - the system paths that nono's default groups grant. These include the
@@ -108,24 +108,40 @@ The host treats every byte of an answer as hostile when it lands it.
 ## The request store
 
 The daemon implements the daemon's side of the request store,
-`<state>/engine-requests/<engine>/<key>/`. The rules for the store belong
-to llm-wiki-plugins: its machine-config contract
+`<store>/<machine>/<key>/`. Each machine that submits writes only its own
+`<machine>` segment, and the daemon serves every segment. The rules for the
+store belong to llm-wiki-plugins: its machine-config contract
 (`docs/contracts/dev/machine-config.md`, the section
 "`<state>/engine-requests/`"). When this README and that contract disagree,
 the contract wins.
 
+The store can be a folder that a sync tool, such as Dropbox, Google Drive
+in mirror mode, or rsync, carries from another machine. Files then arrive
+in any order, and a file can be half written for a while.
+
 What the daemon does:
 
-1. **Find work.** Every 2 seconds, it lists its engine's folder. It takes
-   each request folder that holds `request.json` and no `result.json`.
+1. **Find work.** Every 2 seconds, it lists each machine's segment of the
+   store. It takes each request folder that holds `request.json` and no
+   `result.json`. A segment name is a machine id (`[a-z0-9][a-z0-9-]*`),
+   and a folder name is a 64-hex key. It skips every other name, such as a
+   sync tool's debris.
 2. **Read the request.** It reads `request.json` with `O_NOFOLLOW` and a
    64 KiB cap. It skips a folder whose request is a link, is not a regular
    file, or is off its shape. It never writes `body<suffix>` or
    `request.json`.
-3. **Convert.** It calls the converter in one of `threads` workers.
-4. **Answer, result last.** It writes `output.md` for a converted file,
+3. **Wait for the body.** It converts only when the body's sha256 is the
+   request's `sha256`. Until then, the request waits. The daemon does not
+   count an attempt and does not answer.
+4. **Convert.** It calls the converter in one of `threads` workers.
+5. **Answer, result last.** It writes `output.md` for a converted file,
    then `result.json`. It writes each under a `.tmp-` name first, then
-   renames it into place.
+   renames it into place. A converted answer's `result.json` names
+   `output.md`'s sha256 and size (`output_sha256`, `output_size`). The host
+   lands it only when `output.md` matches them.
+
+The daemon writes only `output.md`, `result.json` and its own `.tmp-`
+names. It never reads or removes any other name in a request folder.
 
 How it handles failures:
 

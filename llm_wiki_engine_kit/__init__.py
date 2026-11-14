@@ -1,7 +1,9 @@
-"""Turn a convert function into a daemon that serves one engine's folder of the request store.
+"""Turn a convert function into a daemon that serves one engine's request store.
 
-The machine-config contract owns the store (`<state>/engine-requests/<engine>/<key>/`). An engine passes `serve` a
-factory. The factory builds the converter, and it runs only in the inner process, inside the jail:
+The machine-config contract owns the store (`<store>/<machine>/<key>/`). Each machine that submits writes only its own
+segment, and a sync tool (Dropbox, Google Drive, rsync) may carry the store between machines, so a folder can arrive in
+any order and half written: the daemon converts a body only once its sha256 is the request's, and names its output's
+sha256 and size in `result.json`. An engine passes `serve` a factory. The factory builds the converter, and it runs only in the inner process, inside the jail:
 
     def make_converter(daemon: dict) -> Callable[[Path, Path, dict], dict | None]: ...
     serve(engine="docling", factory=make_converter, threads=1, reads=[...], env={...})
@@ -12,13 +14,14 @@ markdown to, and the request. It answers None for a converted file, or `{"reason
 Started as the outer process, `serve` re-execs itself under `nono` and imports nothing of the engine. The inner process
 knows itself by `INNER_ENV`, never by its argv, so an engine that hands `serve` its own `argv` still stops at one level.
 Every name in a request folder is the host's or this daemon's, so a read refuses a link and a write goes to a `.tmp-`
-name first.
+name first. Any other name, a sync tool's debris included, is never read or written.
 """
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -61,6 +64,10 @@ STOP_ESCALATE_SECONDS = 10.0
 _MARKER_CAP = 32
 UNREADABLE = {"reason": "unreadable", "traits": []}
 _BODY = re.compile(r"body(\.[A-Za-z0-9]+)*")
+# A submitting machine's segment and a request's key, as the host names them; any other name is not a request.
+_MACHINE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+_KEY = _SHA256 = re.compile(r"[0-9a-f]{64}")
+_CHUNK = 1024 * 1024
 _READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _WRITE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -119,7 +126,57 @@ def read_request(folder: Path) -> dict | None:
         return None
     if not _BODY.fullmatch(request["body"]) or not isinstance(request.get("options", {}), dict):
         return None
+    if not isinstance(request.get("sha256"), str) or not _SHA256.fullmatch(request["sha256"]):
+        return None
     return request
+
+
+def ident(folder: Path) -> str:
+    """A request folder's name across every machine's segment: `<machine>.<key>`, a file name of its own."""
+    return f"{folder.parent.name}.{folder.name}"
+
+
+# The body's sha256 by `(device, inode, size, mtime_ns)`, so a body still syncing is hashed once per change.
+_HASHED: dict[tuple[int, int, int, int], str] = {}
+
+
+def body_arrived(folder: Path, request: dict) -> bool:
+    """Whether the folder's body is a regular file whose sha256 is the request's. A sync tool carries the body and
+    `request.json` in any order, and a body half written: until it matches, the request waits, never answered."""
+    try:
+        fd = os.open(folder / request["body"], _READ)
+    except OSError:
+        return False
+    try:
+        held = os.fstat(fd)
+        if not stat.S_ISREG(held.st_mode):
+            return False
+        seen = (held.st_dev, held.st_ino, held.st_size, held.st_mtime_ns)
+        if seen not in _HASHED:
+            digest = hashlib.sha256()
+            while chunk := os.read(fd, _CHUNK):
+                digest.update(chunk)
+            if len(_HASHED) > 4096:
+                _HASHED.clear()
+            _HASHED[seen] = digest.hexdigest()
+        return _HASHED[seen] == request["sha256"]
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _digest(fd: int, name: str) -> tuple[str, int]:
+    """`name`'s sha256 and size, read through the folder `fd`, never through a link."""
+    held = os.open(name, _READ, dir_fd=fd)
+    try:
+        digest, size = hashlib.sha256(), 0
+        while chunk := os.read(held, _CHUNK):
+            digest.update(chunk)
+            size += len(chunk)
+    finally:
+        os.close(held)
+    return digest.hexdigest(), size
 
 
 def _write_new(fd: int, name: str, data: bytes) -> None:
@@ -183,7 +240,9 @@ def _shape(answer) -> dict:
 
 
 def answer(folder: Path, request: dict, converter: Converter) -> bool:
-    """Convert one request and answer it, `output.md` first and `result.json` last, each through a `.tmp-` name.
+    """Convert one request and answer it, `output.md` first and `result.json` last, each through a `.tmp-` name. A
+    converted answer's `result.json` names `output.md`'s sha256 and size, so a host across a sync tool lands it only
+    once it arrived whole.
 
     True where the converter raised: the inner process then recycles. Each attempt is counted in `.tmp-attempts`
     before the convert, so a convert that kills the process is tried `MAX_ATTEMPTS` times, then answered `unreadable`.
@@ -198,7 +257,7 @@ def answer(folder: Path, request: dict, converter: Converter) -> bool:
         failed = False
         tried = _attempts(fd)
         if tried >= MAX_ATTEMPTS:
-            _say(f"{folder.name}: {tried} attempts ended the process; answering unreadable")
+            _say(f"{ident(folder)}: {tried} attempts ended the process; answering unreadable")
             result = UNREADABLE
         elif not _regular(fd, request["body"]):
             result = UNREADABLE
@@ -209,15 +268,16 @@ def answer(folder: Path, request: dict, converter: Converter) -> bool:
                 got = converter(folder / request["body"], folder / TMP_OUTPUT, request)
                 result = None if got is None else _shape(got)
             except Exception as exc:
-                _say(f"{folder.name}: the converter raised {type(exc).__name__}: {exc}")
+                _say(f"{ident(folder)}: the converter raised {type(exc).__name__}: {exc}")
                 result, failed = UNREADABLE, True
             finally:
                 _ended(folder)
         if result is None:
             if _regular(fd, TMP_OUTPUT):
                 _sync(fd, TMP_OUTPUT)
+                sha, size = _digest(fd, TMP_OUTPUT)
                 _publish(fd, TMP_OUTPUT, OUTPUT)
-                result = {"reason": None, "traits": []}
+                result = {"reason": None, "traits": [], "output_sha256": sha, "output_size": size}
             else:
                 result = UNREADABLE
         _write_new(fd, TMP_RESULT, (json.dumps(result) + "\n").encode("utf-8"))
@@ -228,7 +288,7 @@ def answer(folder: Path, request: dict, converter: Converter) -> bool:
             pass
     finally:
         os.close(fd)
-    _say(f"{folder.name}: answered reason={result['reason']}")
+    _say(f"{ident(folder)}: answered reason={result['reason']}")
     return failed
 
 
@@ -241,16 +301,16 @@ def _timeout(request: dict) -> float:
 
 def _started(folder: Path, tried: int, request: dict) -> None:
     with _LOCK:
-        _RUNNING[folder.name] = (folder, tried)
+        _RUNNING[ident(folder)] = (folder, tried)
     for kit in _KIT:
-        (kit / f"{CONVERTING}{folder.name}").write_text(str(_timeout(request)), encoding="ascii")
+        (kit / f"{CONVERTING}{ident(folder)}").write_text(str(_timeout(request)), encoding="ascii")
 
 
 def _ended(folder: Path) -> None:
     with _LOCK:
-        _RUNNING.pop(folder.name, None)
+        _RUNNING.pop(ident(folder), None)
     for kit in _KIT:
-        (kit / f"{CONVERTING}{folder.name}").unlink(missing_ok=True)
+        (kit / f"{CONVERTING}{ident(folder)}").unlink(missing_ok=True)
 
 
 def _take_back(folder: Path, tried: int) -> None:
@@ -289,34 +349,46 @@ def _absent(folder: Path, name: str) -> bool:
     return False
 
 
-def pending(store: Path, busy: set[str]) -> list[Path]:
-    """Every folder in `store` that has a `request.json`, no `result.json` and is not in `busy`, by name."""
+def _dirs(parent: Path, pattern: re.Pattern) -> list[Path]:
+    """Each real directory in `parent` whose name is `pattern`, by name; a link or a sync tool's debris is skipped."""
     try:
-        entries = sorted(os.scandir(store), key=lambda entry: entry.name)
+        entries = sorted(os.scandir(parent), key=lambda entry: entry.name)
     except OSError:
         return []
     found = []
     for entry in entries:
-        if entry.name.startswith(".") or entry.name in busy or not entry.is_dir(follow_symlinks=False):
+        try:
+            if pattern.fullmatch(entry.name) and entry.is_dir(follow_symlinks=False):
+                found.append(Path(entry.path))
+        except OSError:
             continue
-        folder = Path(entry.path)
-        if not _absent(folder, REQUEST) and _absent(folder, RESULT):
-            found.append(folder)
     return found
+
+
+def pending(store: Path, busy: set[str]) -> list[Path]:
+    """Every request folder in every machine's segment of `store` that has a `request.json`, no `result.json` and is
+    not in `busy` (by `ident`), by key, then machine."""
+    found = []
+    for segment in _dirs(store, _MACHINE):
+        for folder in _dirs(segment, _KEY):
+            if ident(folder) not in busy and not _absent(folder, REQUEST) and _absent(folder, RESULT):
+                found.append(folder)
+    return sorted(found, key=lambda folder: (folder.name, folder.parent.name))
 
 
 # --- the inner process ----------------------------------------------------------
 
 
 def _work(folder: Path, converter: Converter) -> bool | None:
-    """One folder's answer; None where its request does not read, or the folder went away mid-answer (a host prune)."""
+    """One folder's answer; None where its request does not read or its body has not arrived whole, or the folder went
+    away mid-answer (a host prune)."""
     request = read_request(folder)
-    if request is None:
+    if request is None or not body_arrived(folder, request):
         return None
     try:
         return answer(folder, request, converter)
     except OSError as exc:
-        _say(f"{folder.name}: skipped, the folder did not take the answer: {exc}")
+        _say(f"{ident(folder)}: skipped, the folder did not take the answer: {exc}")
         return None
 
 
@@ -380,11 +452,11 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
                 suspects = [folder for folder in waiting if _tried(folder)]
                 if suspects:
                     if not running:
-                        alone = suspects[0].name
+                        alone = ident(suspects[0])
                         running[pool.submit(_work, suspects[0], converter)] = alone
                 else:
                     for folder in waiting[: max(room, 0)]:
-                        running[pool.submit(_work, folder, converter)] = folder.name
+                        running[pool.submit(_work, folder, converter)] = ident(folder)
             if not running:
                 skipped.clear()
                 time.sleep(timings.scan)

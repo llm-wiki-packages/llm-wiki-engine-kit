@@ -2,6 +2,7 @@
 
 import collections
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -24,13 +25,28 @@ FAST = ["--scan-seconds", "0.05", "--poll-seconds", "0.05", "--backoff-seconds",
 FAST += ["--backoff-ceiling-seconds", "0.2", "--stop-escalate-seconds", str(ESCALATE)]
 
 
-def a_folder(store: Path, name: str, text: str = "hello", *, options=None) -> Path:
-    folder = store / name
+MACHINE = "box-a"
+
+
+def key_of(name: str) -> str:
+    """A request key that sorts as `name` does."""
+    return name.encode("utf-8").hex().ljust(64, "0")
+
+
+def a_folder(store: Path, name: str, text: str = "hello", *, options=None, machine: str = MACHINE) -> Path:
+    """A request folder at `<store>/<machine>/<key>/`, as a host submits it."""
+    folder = store / machine / key_of(name)
     folder.mkdir(parents=True)
     (folder / "body.txt").write_text(text, encoding="utf-8")
-    request = {"v": 1, "engine": "stub", "section": "convert", "sha256": "0" * 64, "body": "body.txt"}
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    request = {"v": 1, "engine": "stub", "section": "convert", "sha256": sha, "body": "body.txt"}
     (folder / "request.json").write_text(json.dumps({**request, "options": options or {}}), encoding="utf-8")
     return folder
+
+
+def converted(text: str) -> dict:
+    data = text.encode("utf-8")
+    return {"reason": None, "traits": [], "output_sha256": hashlib.sha256(data).hexdigest(), "output_size": len(data)}
 
 
 def result_of(folder: Path) -> dict:
@@ -90,7 +106,7 @@ def test_result_json_lands_only_after_the_whole_output_md(tmp_path, monkeypatch)
 
     assert kit.answer(folder, kit.read_request(folder), convert) is False
     assert seen == ["# whole\n"]
-    assert result_of(folder) == {"reason": None, "traits": []}
+    assert result_of(folder) == converted("# whole\n")
     assert sorted(p.name for p in folder.iterdir()) == ["body.txt", "output.md", "request.json", "result.json"]
 
 
@@ -144,7 +160,7 @@ def test_leftover_tmp_names_from_a_dead_daemon_are_written_over(tmp_path):
 
     kit.answer(folder, kit.read_request(folder), convert)
     assert (folder / "output.md").read_text(encoding="utf-8") == "# fresh\n"
-    assert result_of(folder) == {"reason": None, "traits": []}
+    assert result_of(folder) == converted("# fresh\n")
     assert not (tmp_path / "victim").exists()
 
 
@@ -312,7 +328,57 @@ def test_a_folder_with_result_json_is_left_alone(tmp_path):
     (done / "result.json").write_text('{"reason": null}', encoding="utf-8")
     waiting = a_folder(store, "waiting")
     assert kit.pending(store, set()) == [waiting]
-    assert kit.pending(store, {"waiting"}) == []
+    assert kit.pending(store, {kit.ident(waiting)}) == []
+
+
+def test_every_machines_segment_is_served_and_sync_debris_is_not(tmp_path):
+    store = tmp_path / "store"
+    mine, theirs = a_folder(store, "a"), a_folder(store, "a", machine="box-b")
+    (store / ".dropbox.cache").mkdir()
+    (store / "~$x").write_text("x")
+    (store / "box-b (conflicted copy)").mkdir()
+    a_folder(store / "box-b (conflicted copy)", "c", machine="")
+    for name in (".output.md.Ab12Cd", "result (conflicted copy).json", "output (1).md"):
+        (store / MACHINE / name).mkdir()
+        (store / MACHINE / name / "request.json").write_text("{}")
+    a_folder(store, "old-layout", machine="").rename(store / ("e" * 64))
+    assert kit.pending(store, set()) == [mine, theirs]
+    assert kit.ident(mine) != kit.ident(theirs)
+
+
+def test_debris_inside_a_request_folder_is_left_alone(tmp_path):
+    folder = a_folder(tmp_path / "store", "k")
+    debris = ("~$x", "result (conflicted copy).json", "output (1).md", ".output.md.Ab12Cd")
+    for name in debris:
+        (folder / name).write_text('{"reason": "timeout"}', encoding="utf-8")
+    assert kit._work(folder, lambda body, out, request: out.write_text("# ok\n") and None) is False
+    assert result_of(folder) == converted("# ok\n")
+    assert all((folder / name).read_text() == '{"reason": "timeout"}' for name in debris)
+
+
+@pytest.mark.parametrize("arrived", [None, "hel", "hellO"])
+def test_a_body_that_has_not_fully_arrived_waits_and_is_neither_tried_nor_answered(tmp_path, arrived):
+    folder = a_folder(tmp_path / "store", "k")
+    (folder / "body.txt").unlink()
+    if arrived is not None:
+        (folder / "body.txt").write_text(arrived, encoding="utf-8")
+    called = []
+    assert kit._work(folder, lambda body, out, request: called.append(body)) is None
+    assert called == [] and sorted(p.name for p in folder.iterdir()) == sorted(
+        ["request.json", *([] if arrived is None else ["body.txt"])]
+    )
+    (folder / "body.txt").unlink(missing_ok=True)
+    (folder / "body.txt").write_text("hello", encoding="utf-8")
+    assert kit._work(folder, lambda body, out, request: out.write_text("# ok\n") and None) is False
+    assert result_of(folder) == converted("# ok\n")
+
+
+def test_a_request_with_no_body_sha256_does_not_read(tmp_path):
+    folder = a_folder(tmp_path / "store", "k")
+    request = json.loads((folder / "request.json").read_text())
+    for sha in (None, "x", "A" * 64):
+        (folder / "request.json").write_text(json.dumps({**request, "sha256": sha}), encoding="utf-8")
+        assert kit.read_request(folder) is None
 
 
 def test_a_request_json_that_is_a_link_does_not_read(tmp_path):
@@ -331,7 +397,8 @@ def test_a_request_json_over_64_kib_does_not_read(tmp_path):
 
 def test_a_request_whose_body_leaves_the_folder_does_not_read(tmp_path):
     folder = a_folder(tmp_path / "store", "k")
-    (folder / "request.json").write_text(json.dumps({"body": "../other/body.txt", "options": {}}), encoding="utf-8")
+    doc = {"body": "../other/body.txt", "sha256": "0" * 64, "options": {}}
+    (folder / "request.json").write_text(json.dumps(doc), encoding="utf-8")
     assert kit.read_request(folder) is None
 
 
@@ -374,6 +441,19 @@ def test_after_fifty_files_the_inner_process_exits_and_a_new_one_answers_the_nex
     assert folders[-1].joinpath("output.md").read_text(encoding="utf-8").split()[-1] != str(proc.pid)
 
 
+def test_a_body_still_syncing_is_answered_once_it_arrives_whole(tmp_path, daemon):
+    folder = a_folder(tmp_path / "store", "k", text="hello")
+    (folder / "body.txt").write_text("hel", encoding="utf-8")
+    proc = daemon("echo")
+    time.sleep(0.5)
+    assert sorted(p.name for p in folder.iterdir()) == ["body.txt", "request.json"]
+    (folder / ".body.txt.Ab12Cd").write_text("hello", encoding="utf-8")
+    (folder / ".body.txt.Ab12Cd").rename(folder / "body.txt")
+    wait_for(folder / "result.json", proc)
+    assert result_of(folder)["reason"] is None
+    assert (folder / "output.md").read_text(encoding="utf-8").startswith("hello\n")
+
+
 def test_after_a_kill_mid_convert_a_restart_answers_the_folder(tmp_path, daemon):
     folder = a_folder(tmp_path / "store", "k")
     proc = daemon("stall")
@@ -383,7 +463,7 @@ def test_after_a_kill_mid_convert_a_restart_answers_the_folder(tmp_path, daemon)
     assert not (folder / "result.json").exists()
     again = daemon("echo")
     wait_for(folder / "result.json", again)
-    assert result_of(folder) == {"reason": None, "traits": []}
+    assert result_of(folder) == converted((folder / "output.md").read_text(encoding="utf-8"))
     assert (folder / "output.md").read_text(encoding="utf-8").startswith("hello\n")
 
 
@@ -417,7 +497,7 @@ def test_with_two_threads_a_crash_charges_only_the_folder_that_crashed(tmp_path,
     proc = daemon("crash", "--threads", "2")
     wait_for(slower / "result.json", proc)
     wait_for(crashing / "result.json", proc)
-    assert result_of(slower) == {"reason": None, "traits": []}
+    assert result_of(slower) == converted("innocent")
     assert (slower / "output.md").read_text(encoding="utf-8") == "innocent"
     assert result_of(crashing) == {"reason": "unreadable", "traits": []}
 
