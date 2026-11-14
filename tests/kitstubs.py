@@ -154,3 +154,15 @@ def spawner(daemon):
         time.sleep(600)
 
     return convert
+
+
+def narrator(daemon):
+    """Writes a tagged MP3 and a transcript of the body into the out folder."""
+
+    def convert(body: Path, out: Path, request: dict):
+        text = body.read_text(encoding="utf-8")
+        (out / "output.mp3").write_bytes(b"ID3\x04\x00\x00\x00\x00\x00\x00" + text.encode("utf-8"))
+        (out / "output.vtt").write_text(f"WEBVTT\n\n00:00.000 --> 00:01.000\n{text}\n", encoding="utf-8")
+        return None
+
+    return convert

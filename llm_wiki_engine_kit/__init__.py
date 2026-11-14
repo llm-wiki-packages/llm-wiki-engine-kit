@@ -8,8 +8,11 @@ file's sha256 and size in `result.json`'s `outputs`. An engine passes `serve` a 
     def make_converter(daemon: dict) -> Callable[[Path, Path, dict], dict | None]: ...
     serve(engine="docling", factory=make_converter, threads=1, reads=[...], env={...})
 
-`daemon` holds `engine`, `store`, `scratch` and `threads`. The converter gets the body's path, the path to write the
-markdown to, and the request. It answers None for a converted file, or `{"reason": <reason>, "traits": [...]}`.
+`daemon` holds `engine`, `sections`, `store`, `scratch` and `threads`. The converter gets the body's path, where to
+write, and the request. For a text section (`convert`, `transcribe`) it writes the markdown to that path; for a media
+section (`narrate`) the path is an empty folder, and it writes the section's files into it (`output.mp3`, and
+`output.vtt` if it has one). It answers None for a converted file, or `{"reason": <reason>, "traits": [...]}`. The kit
+publishes no file the host would refuse: it answers a reason instead.
 
 Started as the outer process, `serve` re-execs itself under `nono` and imports nothing of the engine. The inner process
 knows itself by `INNER_ENV`, never by its argv, so an engine that hands `serve` its own `argv` still stops at one level.
@@ -20,6 +23,7 @@ name first. Any other name, a sync tool's debris included, is never read or writ
 from __future__ import annotations
 
 import argparse
+import codecs
 import fcntl
 import hashlib
 import json
@@ -36,10 +40,19 @@ from dataclasses import dataclass
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Iterator, Mapping
 
 REQUEST, RESULT, OUTPUT = "request.json", "result.json", "output.md"
+MP3, VTT = "output.mp3", "output.vtt"
 TMP_OUTPUT, TMP_RESULT, TMP_ATTEMPTS = ".tmp-output.md", ".tmp-result.json", ".tmp-attempts"
+# The folder a media section's converter writes its files into, inside the request folder: a rename then publishes
+# each file's own inode.
+TMP_MEDIA = ".tmp-out"
+# The host's: the files an answer to each section may hold, the first the one a converted answer must list; and each
+# file's cap. The host refuses an answer past them, so the kit answers a reason instead of publishing one.
+SECTION_OUTPUTS = {"convert": (OUTPUT,), "transcribe": (OUTPUT,), "narrate": (MP3, VTT)}
+TEXT_SECTIONS = ("convert", "transcribe")
+OUTPUT_CAPS = {OUTPUT: 4 * 16 * 1024 * 1024 + 64 * 1024, MP3: 512 * 1024 * 1024, VTT: 4 * 16 * 1024 * 1024 + 64 * 1024}
 # A folder whose convert killed the inner process this many times answers `unreadable` at the next start.
 MAX_ATTEMPTS = 2
 REQUEST_CAP = 64 * 1024
@@ -64,6 +77,7 @@ _POLL_SECONDS = 0.25
 STOP_ESCALATE_SECONDS = 10.0
 _MARKER_CAP = 32
 UNREADABLE = {"reason": "unreadable", "traits": []}
+UNSUPPORTED = {"reason": "unsupported", "traits": []}
 _BODY = re.compile(r"body(\.[A-Za-z0-9]+)*")
 # A submitting machine's segment and a request's key, as the host names them; any other name is not a request.
 _MACHINE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
@@ -156,6 +170,8 @@ def read_request(folder: Path) -> dict | None:
     if not _BODY.fullmatch(request["body"]) or not isinstance(request.get("options", {}), dict):
         return None
     if not isinstance(request.get("sha256"), str) or not _SHA256.fullmatch(request["sha256"]):
+        return None
+    if not isinstance(request.get("section", "convert"), str):
         return None
     return request
 
@@ -263,19 +279,6 @@ def _hash(fd: int, name: str, seen: tuple[int, int, int, int, int]) -> str | Non
     return found
 
 
-def _digest(fd: int, name: str) -> tuple[str, int]:
-    """`name`'s sha256 and size, read through the folder `fd`, never through a link."""
-    held = os.open(name, _READ, dir_fd=fd)
-    try:
-        digest, size = hashlib.sha256(), 0
-        while chunk := os.read(held, _CHUNK):
-            digest.update(chunk)
-            size += len(chunk)
-    finally:
-        os.close(held)
-    return digest.hexdigest(), size
-
-
 def _write_new(fd: int, name: str, data: bytes) -> None:
     """`name` in the folder `fd`, made fresh: a leftover from a dead daemon, a link included, is removed first."""
     try:
@@ -288,14 +291,6 @@ def _write_new(fd: int, name: str, data: bytes) -> None:
         os.fsync(out)
     finally:
         os.close(out)
-
-
-def _sync(fd: int, name: str) -> None:
-    held = os.open(name, _READ, dir_fd=fd)
-    try:
-        os.fsync(held)
-    finally:
-        os.close(held)
 
 
 def _publish(fd: int, src: str, dst: str) -> None:
@@ -336,35 +331,211 @@ def _shape(answer) -> dict:
     return {"reason": answer["reason"], "traits": list(traits)}
 
 
-def answer(folder: Path, request: dict, converter: Converter) -> bool:
-    """Convert one request and answer it, `output.md` first and `result.json` last, each through a `.tmp-` name. A
-    converted answer's `result.json` maps each output file to its sha256 and size (`outputs`), so a host across a sync
-    tool lands it only once every file arrived whole.
+def _clear(fd: int, name: str) -> None:
+    """`name` in the folder `fd` removed, a folder with all it holds; a link is unlinked, never followed. A folder the
+    converter left without write permission is given it back, never through a link, and removed again."""
+    try:
+        held = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(held.st_mode):
+        os.unlink(name, dir_fd=fd)
+        return
+    try:
+        shutil.rmtree(name, dir_fd=fd)
+    except OSError:
+        _writable(fd, name)
+        shutil.rmtree(name, dir_fd=fd)
+
+
+def _writable(fd: int, name: str) -> None:
+    """Every folder in the tree at `name` in the folder `fd` made the owner's to list and write; a link is never
+    followed, nor a file's mode touched. Depth first, holding a descriptor only for each folder on the current path."""
+    path: list[tuple[int, Iterator[str]]] = []
+    try:
+        opened = _unlocked(fd, name)
+        if opened is not None:
+            path.append(opened)
+        while path:
+            parent, names = path[-1]
+            child = next(names, None)
+            if child is None:
+                os.close(path.pop()[0])
+                continue
+            opened = _unlocked(parent, child)
+            if opened is not None:
+                path.append(opened)
+    finally:
+        for held, _names in path:
+            os.close(held)
+
+
+def _unlocked(parent: int, name: str) -> tuple[int, Iterator[str]] | None:
+    """The folder `name` in `parent` made the owner's to list and write, opened, with its names; None where it is not
+    a folder or does not open."""
+    try:
+        if not stat.S_ISDIR(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
+            return None
+        os.chmod(name, 0o700, dir_fd=parent, follow_symlinks=False)
+        held = os.open(name, _DIR, dir_fd=parent)
+    except OSError:
+        return None
+    try:
+        return held, iter(os.listdir(held))
+    except OSError:
+        os.close(held)
+        return None
+
+
+def _cleared(fd: int, names: Iterable[str]) -> bool:
+    """Whether every name in `names` is gone from the folder `fd` (`_clear`); a name that stays is said, not raised,
+    so a leftover that will not go answers rather than retrying until the host's deadline."""
+    for name in names:
+        try:
+            _clear(fd, name)
+        except OSError as exc:
+            _say(f"{name} did not clear: {exc}")
+            return False
+    return True
+
+
+def _mp3_head(head: bytes) -> bool:
+    """The host's check: an MP3 opens with an ID3 tag or an MPEG frame sync (eleven set bits)."""
+    return head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0)
+
+
+def _checked(held: int, name: str) -> tuple[str, int, tuple[int, int]] | dict:
+    """The open output `held`, to be published as `name`: its sha256, size and identity, read from this one inode.
+    A failure answer where the host would refuse it: not a regular file of one name, past its cap, not UTF-8 where
+    it is text, or not opening as its name says; or changed while it was read."""
+    before = os.fstat(held)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        return UNREADABLE
+    cap = OUTPUT_CAPS[name]
+    if before.st_size > cap:
+        return TOO_LARGE
+    os.fsync(held)
+    digest, size, head = hashlib.sha256(), 0, b""
+    text = None if name == MP3 else codecs.getincrementaldecoder("utf-8")()
+    try:
+        while chunk := os.read(held, _CHUNK):
+            size += len(chunk)
+            if size > cap:
+                return TOO_LARGE
+            if len(head) < 16:
+                head += chunk[: 16 - len(head)]
+            digest.update(chunk)
+            if text is not None:
+                text.decode(chunk)
+        if text is not None:
+            text.decode(b"", final=True)
+    except UnicodeDecodeError:
+        return UNREADABLE
+    after = os.fstat(held)
+    if (after.st_size, after.st_mtime_ns) != (size, before.st_mtime_ns):
+        return UNREADABLE
+    if name == MP3 and not _mp3_head(head):
+        return UNREADABLE
+    if name == VTT and not head.removeprefix(b"\xef\xbb\xbf").startswith(b"WEBVTT"):
+        return UNREADABLE
+    return digest.hexdigest(), size, (before.st_dev, before.st_ino)
+
+
+def _publish_outputs(fd: int, section: str) -> dict:
+    """The converter's files checked, then each renamed into the folder `fd` under its answer name: a converted
+    answer's `result.json`, or a failure answer with nothing published. Every file is checked before any is renamed,
+    and each published name is the very inode its digest was read from."""
+    names = SECTION_OUTPUTS[section]
+    media = names != (OUTPUT,)
+    try:
+        source = os.open(TMP_MEDIA, _DIR, dir_fd=fd) if media else os.dup(fd)
+    except OSError:
+        return UNREADABLE
+    if media:
+        # The converter may have taken write permission off its own folder; the renames out of it need it.
+        os.fchmod(source, 0o700)
+    # Each checked file stays open until its published name is compared: an inode still open is never freed, so its
+    # number cannot pass to a file swapped in after the check.
+    opened: list[int] = []
+    try:
+        found: list[tuple[str, str, tuple[str, int, tuple[int, int]]]] = []
+        for name in names:
+            src = name if media else TMP_OUTPUT
+            try:
+                held = os.open(src, _READ, dir_fd=source)
+            except FileNotFoundError:
+                if name == names[0]:
+                    return UNREADABLE
+                continue
+            except OSError:
+                return UNREADABLE
+            opened.append(held)
+            checked = _checked(held, name)
+            if isinstance(checked, dict):
+                return checked
+            found.append((src, name, checked))
+        published = []
+        for src, name, (_sha, _size, identity) in found:
+            _publish_from(source, src, fd, name)
+            published.append(name)
+            now = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if (now.st_dev, now.st_ino) != identity:
+                for one in published:
+                    _clear(fd, one)
+                return UNREADABLE
+        outputs = {name: {"sha256": sha, "size": size} for _src, name, (sha, size, _identity) in found}
+        return {"reason": None, "traits": [], "outputs": outputs}
+    finally:
+        for held in opened:
+            os.close(held)
+        os.close(source)
+
+
+def _publish_from(source: int, src: str, fd: int, dst: str) -> None:
+    """Rename `src` in the folder `source` to `dst` in the folder `fd`, then sync `fd`."""
+    os.replace(src, dst, src_dir_fd=source, dst_dir_fd=fd)
+    os.fsync(fd)
+
+
+def answer(folder: Path, request: dict, converter: Converter, *, sections: Iterable[str] = TEXT_SECTIONS) -> bool:
+    """Convert one request and answer it, each output file first and `result.json` last, each through a `.tmp-` name.
+    A converted answer's `result.json` maps each output file to its sha256 and size (`outputs`), so a host across a
+    sync tool lands it only once every file arrived whole.
+
+    `sections` are the sections this engine serves; a request for another is answered `unsupported`, never tried. A
+    text section's converter writes `.tmp-output.md`; a media section's writes its files into the empty folder
+    `.tmp-out`. Every file is checked as the host checks it before any is published (`_publish_outputs`).
 
     True where the converter raised: the inner process then recycles. Each attempt is counted in `.tmp-attempts`
     before the convert, so a convert that kills the process is tried `MAX_ATTEMPTS` times, then answered `unreadable`.
     The body and `request.json` are never written.
     """
+    section = request.get("section", "convert")
     fd = folder_fd(folder)
     try:
-        try:
-            os.unlink(TMP_OUTPUT, dir_fd=fd)
-        except FileNotFoundError:
-            pass
+        # A dead daemon's leftovers, its published outputs included: a reason answer then stands alone.
+        clean = _cleared(fd, (TMP_OUTPUT, TMP_MEDIA, *SECTION_OUTPUTS.get(section, ())))
         failed = False
         tried = _attempts(fd)
-        if tried >= MAX_ATTEMPTS:
+        if not clean:
+            result = UNREADABLE
+        elif tried >= MAX_ATTEMPTS:
             _say(f"{ident(folder)}: {tried} attempts ended the process; answering unreadable")
             result = UNREADABLE
+        elif section not in sections or section not in SECTION_OUTPUTS:
+            result = UNSUPPORTED
         elif not _regular(fd, request["body"]):
             result = UNREADABLE
         elif os.stat(request["body"], dir_fd=fd, follow_symlinks=False).st_size > MAX_BODY_BYTES:
             result = TOO_LARGE
         else:
+            media = SECTION_OUTPUTS[section] != (OUTPUT,)
+            if media:
+                os.mkdir(TMP_MEDIA, 0o755, dir_fd=fd)
             _write_new(fd, TMP_ATTEMPTS, str(tried + 1).encode("ascii"))
             _started(folder, tried, request)
             try:
-                got = converter(folder / request["body"], folder / TMP_OUTPUT, request)
+                got = converter(folder / request["body"], folder / (TMP_MEDIA if media else TMP_OUTPUT), request)
                 result = None if got is None else _shape(got)
             except Exception as exc:
                 _say(f"{ident(folder)}: the converter raised {type(exc).__name__}: {exc}")
@@ -372,13 +543,9 @@ def answer(folder: Path, request: dict, converter: Converter) -> bool:
             finally:
                 _ended(folder)
         if result is None:
-            if _regular(fd, TMP_OUTPUT):
-                _sync(fd, TMP_OUTPUT)
-                sha, size = _digest(fd, TMP_OUTPUT)
-                _publish(fd, TMP_OUTPUT, OUTPUT)
-                result = {"reason": None, "traits": [], "outputs": {OUTPUT: {"sha256": sha, "size": size}}}
-            else:
-                result = UNREADABLE
+            result = _publish_outputs(fd, section)
+        # A leftover that stays costs the folder some space, not its answer.
+        _cleared(fd, (TMP_OUTPUT, TMP_MEDIA))
         _write_new(fd, TMP_RESULT, (json.dumps(result) + "\n").encode("utf-8"))
         _publish(fd, TMP_RESULT, RESULT)
         try:
@@ -478,14 +645,14 @@ def pending(store: Path, busy: set[str]) -> list[Path]:
 # --- the inner process ----------------------------------------------------------
 
 
-def _work(folder: Path, converter: Converter) -> bool | None:
+def _work(folder: Path, converter: Converter, sections: Iterable[str] = TEXT_SECTIONS) -> bool | None:
     """One folder's answer; None where its request does not read, or the folder went away or turned into a link
     mid-answer (a host prune). The main thread asked `ready` first."""
     request = read_request(folder)
     if request is None:
         return None
     try:
-        return answer(folder, request, converter)
+        return answer(folder, request, converter, sections=sections)
     except OSError as exc:
         _say(f"{ident(folder)}: skipped, the folder did not take the answer: {exc}")
         return None
@@ -525,7 +692,15 @@ def _outer_gone(handle: int | None) -> bool:
     return True
 
 
-def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Path, timings: Timings) -> int:
+def _inner(
+    engine: str,
+    factory: Factory,
+    threads: int,
+    store: Path,
+    scratch: Path,
+    timings: Timings,
+    sections: tuple[str, ...] = TEXT_SECTIONS,
+) -> int:
     """Answer requests until a converter raises, `RECYCLE_AFTER` files are done, or the outer process is gone.
 
     A folder an earlier inner process already tried runs alone, so a crash charges its attempt to that folder only.
@@ -539,7 +714,8 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
     outer = _outer_handle(kit)
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    converter = factory({"engine": engine, "store": store, "scratch": scratch, "threads": threads})
+    daemon = {"engine": engine, "sections": sections, "store": store, "scratch": scratch, "threads": threads}
+    converter = factory(daemon)
     done, failed = 0, False
     running: dict[Future, str] = {}
     alone: str | None = None
@@ -565,10 +741,10 @@ def _inner(engine: str, factory: Factory, threads: int, store: Path, scratch: Pa
                 if suspects:
                     if not running:
                         alone = ident(suspects[0])
-                        running[pool.submit(_work, suspects[0], converter)] = alone
+                        running[pool.submit(_work, suspects[0], converter, sections)] = alone
                 else:
                     for folder in waiting[: max(room, 0)]:
-                        running[pool.submit(_work, folder, converter)] = ident(folder)
+                        running[pool.submit(_work, folder, converter, sections)] = ident(folder)
             if not running:
                 time.sleep(timings.scan)
                 continue
@@ -813,11 +989,18 @@ def serve(
     argv: list[str] | None = None,
     timeout_seconds: float = TIMEOUT_SECONDS,
     timings: Timings = Timings(),
+    sections: Iterable[str] = TEXT_SECTIONS,
 ) -> int:
     """Run the daemon for `engine` and answer its exit code; `argv` carries `--store`, `--cache`, `--unjailed`.
 
     `timeout_seconds` is a convert's time for a request whose options carry no `timeout_seconds` of their own.
+    `sections` are the request sections the engine serves (`SECTION_OUTPUTS`); a request for another is answered
+    `unsupported`.
     """
+    sections = tuple(dict.fromkeys(sections))
+    unknown = [one for one in sections if one not in SECTION_OUTPUTS]
+    if unknown or not sections:
+        raise ValueError(f"sections must be some of {sorted(SECTION_OUTPUTS)}, not {unknown or 'none'}")
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--store", required=True)
     parser.add_argument("--cache", required=True)
@@ -829,7 +1012,7 @@ def serve(
         _apply_env(scratch, env or {})
         _DEFAULT_TIMEOUT[0] = float(timeout_seconds)
         _RACY[0] = timings.racy
-        return _inner(engine, factory, max(1, threads), store, scratch, timings)
+        return _inner(engine, factory, max(1, threads), store, scratch, timings, sections)
     store.mkdir(parents=True, exist_ok=True)
     root = _import_root(factory)
     return _outer(store, scratch, [*reads, *([root] if root else [])], args.unjailed, timings)

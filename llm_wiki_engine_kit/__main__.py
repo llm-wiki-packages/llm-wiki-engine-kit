@@ -1,4 +1,4 @@
-"""`python -m llm_wiki_engine_kit serve --store <dir> --cache <dir> --factory <module:function> [--unjailed]`.
+"""`python -m llm_wiki_engine_kit serve --store <dir> --cache <dir> --factory <module:function> [--section ...]`.
 
 It runs any converter as a daemon, for an engine author's own trials and for the kit's tests. `--read` grants the jail
 one more read-only tree, such as the directory that holds the factory's module.
@@ -12,7 +12,7 @@ import importlib
 import sys
 from pathlib import Path
 
-from . import Timings, serve
+from . import TEXT_SECTIONS, Timings, serve
 
 
 def _lazy(spec: str):
@@ -37,6 +37,12 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--factory", required=True, help="module:function that builds the converter")
     run.add_argument("--threads", type=int, default=1)
     run.add_argument(
+        "--section",
+        action="append",
+        dest="sections",
+        help="a request section the engine serves; repeat for more (default: convert and transcribe)",
+    )
+    run.add_argument(
         "--timeout-seconds", type=float, default=1800.0, help="a convert's time, unless its request's options name one"
     )
     run.add_argument("--read", action="append", default=[], help="one more read-only tree for the jail")
@@ -54,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         argv=argv,
         timeout_seconds=args.timeout_seconds,
         timings=Timings(**{field.name: getattr(args, field.name) for field in fields(Timings)}),
+        sections=args.sections or TEXT_SECTIONS,
     )
 
 
