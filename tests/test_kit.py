@@ -46,7 +46,7 @@ def a_folder(store: Path, name: str, text: str = "hello", *, options=None, machi
 
 def converted(text: str) -> dict:
     data = text.encode("utf-8")
-    return {"reason": None, "traits": [], "output_sha256": hashlib.sha256(data).hexdigest(), "output_size": len(data)}
+    return {"reason": None, "traits": [], "outputs": {"output.md": {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}}}
 
 
 def result_of(folder: Path) -> dict:

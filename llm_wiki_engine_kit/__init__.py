@@ -2,8 +2,8 @@
 
 The machine-config contract owns the store (`<store>/<machine>/<key>/`). Each machine that submits writes only its own
 segment, and a sync tool (Dropbox, Google Drive, rsync) may carry the store between machines, so a folder can arrive in
-any order and half written: the daemon converts a body only once its sha256 is the request's, and names its output's
-sha256 and size in `result.json`. An engine passes `serve` a factory. The factory builds the converter, and it runs only in the inner process, inside the jail:
+any order and half written: the daemon converts a body only once its sha256 is the request's, and names each output
+file's sha256 and size in `result.json`'s `outputs`. An engine passes `serve` a factory. The factory builds the converter, and it runs only in the inner process, inside the jail:
 
     def make_converter(daemon: dict) -> Callable[[Path, Path, dict], dict | None]: ...
     serve(engine="docling", factory=make_converter, threads=1, reads=[...], env={...})
@@ -241,8 +241,8 @@ def _shape(answer) -> dict:
 
 def answer(folder: Path, request: dict, converter: Converter) -> bool:
     """Convert one request and answer it, `output.md` first and `result.json` last, each through a `.tmp-` name. A
-    converted answer's `result.json` names `output.md`'s sha256 and size, so a host across a sync tool lands it only
-    once it arrived whole.
+    converted answer's `result.json` maps each output file to its sha256 and size (`outputs`), so a host across a sync
+    tool lands it only once every file arrived whole.
 
     True where the converter raised: the inner process then recycles. Each attempt is counted in `.tmp-attempts`
     before the convert, so a convert that kills the process is tried `MAX_ATTEMPTS` times, then answered `unreadable`.
@@ -277,7 +277,7 @@ def answer(folder: Path, request: dict, converter: Converter) -> bool:
                 _sync(fd, TMP_OUTPUT)
                 sha, size = _digest(fd, TMP_OUTPUT)
                 _publish(fd, TMP_OUTPUT, OUTPUT)
-                result = {"reason": None, "traits": [], "output_sha256": sha, "output_size": size}
+                result = {"reason": None, "traits": [], "outputs": {OUTPUT: {"sha256": sha, "size": size}}}
             else:
                 result = UNREADABLE
         _write_new(fd, TMP_RESULT, (json.dumps(result) + "\n").encode("utf-8"))

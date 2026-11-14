@@ -136,9 +136,10 @@ What the daemon does:
 4. **Convert.** It calls the converter in one of `threads` workers.
 5. **Answer, result last.** It writes `output.md` for a converted file,
    then `result.json`. It writes each under a `.tmp-` name first, then
-   renames it into place. A converted answer's `result.json` names
-   `output.md`'s sha256 and size (`output_sha256`, `output_size`). The host
-   lands it only when `output.md` matches them.
+   renames it into place. A converted answer's `result.json` maps each
+   output file to its sha256 and size:
+   `"outputs": {"output.md": {"sha256": "...", "size": 123}}`. The host
+   lands it only when every listed file is present and matches.
 
 The daemon writes only `output.md`, `result.json` and its own `.tmp-`
 names. It never reads or removes any other name in a request folder.
